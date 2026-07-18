@@ -32,7 +32,7 @@ func (a *API) Routes() http.Handler {
 	mux.HandleFunc("GET /actions/{id}", a.auth(a.handleGetAction))
 
 	mux.HandleFunc("POST /actions/send", a.auth(a.action("send",
-		opSpec{needsTarget: true, exec: a.opSend})))
+		opSpec{needsTarget: true, execR: a.opSend})))
 	mux.HandleFunc("POST /actions/archive", a.auth(a.action("archive", a.opArchive(true))))
 	mux.HandleFunc("POST /actions/unarchive", a.auth(a.action("unarchive", a.opArchive(false))))
 	mux.HandleFunc("POST /actions/mute", a.auth(a.action("mute", a.opMute(true))))
@@ -45,6 +45,63 @@ func (a *API) Routes() http.Handler {
 	mux.HandleFunc("POST /actions/unblock", a.auth(a.action("unblock", a.opBlock(false))))
 	mux.HandleFunc("POST /actions/mark_read", a.auth(a.action("mark_read", a.opMarkRead(true))))
 	mux.HandleFunc("POST /actions/mark_unread", a.auth(a.action("mark_unread", a.opMarkRead(false))))
+
+	// message-level
+	mux.HandleFunc("POST /actions/edit_message", a.auth(a.action("edit_message",
+		opSpec{needsTarget: true, exec: a.opEditMessage})))
+	mux.HandleFunc("POST /actions/react", a.auth(a.action("react",
+		opSpec{needsTarget: true, exec: a.opReact})))
+	mux.HandleFunc("POST /actions/star", a.auth(a.action("star",
+		opSpec{needsTarget: true, destructive: true, exec: a.opStar(true)})))
+	mux.HandleFunc("POST /actions/unstar", a.auth(a.action("unstar",
+		opSpec{needsTarget: true, destructive: true, exec: a.opStar(false)})))
+
+	// chat-level
+	mux.HandleFunc("POST /actions/pin", a.auth(a.action("pin",
+		opSpec{needsTarget: true, destructive: true, exec: a.opPin(true)})))
+	mux.HandleFunc("POST /actions/unpin", a.auth(a.action("unpin",
+		opSpec{needsTarget: true, destructive: true, exec: a.opPin(false)})))
+	mux.HandleFunc("POST /actions/typing", a.auth(a.action("typing",
+		opSpec{needsTarget: true, exec: a.opTyping(true)})))
+	mux.HandleFunc("POST /actions/stop_typing", a.auth(a.action("stop_typing",
+		opSpec{needsTarget: true, exec: a.opTyping(false)})))
+
+	// newsletter
+	mux.HandleFunc("POST /actions/follow", a.auth(a.action("follow",
+		opSpec{needsTarget: true, exec: a.opFollow})))
+	mux.HandleFunc("POST /actions/mute_newsletter", a.auth(a.action("mute_newsletter",
+		opSpec{needsTarget: true, exec: a.opMuteNewsletter(true)})))
+	mux.HandleFunc("POST /actions/unmute_newsletter", a.auth(a.action("unmute_newsletter",
+		opSpec{needsTarget: true, exec: a.opMuteNewsletter(false)})))
+
+	// group management
+	mux.HandleFunc("POST /actions/group_create", a.auth(a.action("group_create",
+		opSpec{needsTarget: false, execR: a.opGroupCreate})))
+	mux.HandleFunc("POST /actions/group_leave", a.auth(a.action("group_leave",
+		opSpec{needsTarget: true, destructive: true, exec: a.opGroupLeave})))
+	mux.HandleFunc("POST /actions/group_add", a.auth(a.action("group_add",
+		opSpec{needsTarget: true, exec: a.opGroupParticipants("add")})))
+	mux.HandleFunc("POST /actions/group_remove", a.auth(a.action("group_remove",
+		opSpec{needsTarget: true, destructive: true, exec: a.opGroupParticipants("remove")})))
+	mux.HandleFunc("POST /actions/group_promote", a.auth(a.action("group_promote",
+		opSpec{needsTarget: true, exec: a.opGroupParticipants("promote")})))
+	mux.HandleFunc("POST /actions/group_demote", a.auth(a.action("group_demote",
+		opSpec{needsTarget: true, exec: a.opGroupParticipants("demote")})))
+	mux.HandleFunc("POST /actions/group_name", a.auth(a.action("group_name",
+		opSpec{needsTarget: true, exec: a.opGroupName})))
+	mux.HandleFunc("POST /actions/group_topic", a.auth(a.action("group_topic",
+		opSpec{needsTarget: true, exec: a.opGroupTopic})))
+	mux.HandleFunc("POST /actions/group_join", a.auth(a.action("group_join",
+		opSpec{needsTarget: false, execR: a.opGroupJoin})))
+
+	// presence (no chat target)
+	mux.HandleFunc("POST /actions/presence", a.auth(a.action("presence",
+		opSpec{needsTarget: false, exec: a.opPresence})))
+
+	// group reads
+	mux.HandleFunc("GET /groups", a.auth(a.handleJoinedGroups))
+	mux.HandleFunc("GET /group", a.auth(a.handleGroupInfo))
+	mux.HandleFunc("GET /group/invite", a.auth(a.handleGroupInvite))
 	return mux
 }
 
@@ -74,6 +131,17 @@ type ActionRequest struct {
 	DurationMS  int64  `json:"duration_ms"`
 	DeleteMedia bool   `json:"delete_media"`
 
+	// message/chat extras
+	Emoji  string `json:"emoji"`
+	FromMe bool   `json:"from_me"`
+
+	// group extras
+	Participants []string `json:"participants"`
+	Name         string   `json:"name"`
+	Topic        string   `json:"topic"`
+	Code         string   `json:"code"`
+	Reset        bool     `json:"reset"`
+
 	DryRun         *bool  `json:"dry_run"`
 	IdempotencyKey string `json:"idempotency_key"`
 }
@@ -89,8 +157,13 @@ func (r *ActionRequest) target() string {
 
 type opFunc func(ctx context.Context, req *ActionRequest, jid types.JID) error
 
+// opFuncR is for ops that return structured data (e.g. send -> msg_id,
+// group_create -> new group jid). Takes precedence over exec when set.
+type opFuncR func(ctx context.Context, req *ActionRequest, jid types.JID) (map[string]any, error)
+
 type opSpec struct {
 	exec        opFunc
+	execR       opFuncR
 	destructive bool // requires post-reconnect sync gate + lastMessage context
 	needsTarget bool
 }
@@ -214,7 +287,13 @@ func (a *API) action(name string, spec opSpec) http.HandlerFunc {
 
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
-		execErr := spec.exec(ctx, &req, jid)
+		var result map[string]any
+		var execErr error
+		if spec.execR != nil {
+			result, execErr = spec.execR(ctx, &req, jid)
+		} else {
+			execErr = spec.exec(ctx, &req, jid)
+		}
 		if execErr != nil {
 			_ = a.store.FinishAction(entry.ID, "failed", execErr.Error())
 			slog.Error("action_failed", "action", name, "chat", jid.String(), "error", execErr.Error())
@@ -225,10 +304,14 @@ func (a *API) action(name string, spec opSpec) http.HandlerFunc {
 		}
 		_ = a.store.FinishAction(entry.ID, "succeeded", "")
 		slog.Info("action_succeeded", "action", name, "chat", jid.String(), "action_id", entry.ID)
-		writeJSON(w, http.StatusOK, map[string]any{
+		resp := map[string]any{
 			"action_id": entry.ID, "action": name, "status": "succeeded",
 			"chat_jid": jid.String(), "chat_name": chatName,
-		})
+		}
+		for k, v := range result {
+			resp[k] = v
+		}
+		writeJSON(w, http.StatusOK, resp)
 	}
 }
 
@@ -247,12 +330,15 @@ func previewMsg(m *MessageRow) map[string]any {
 
 // ---- ops ----
 
-func (a *API) opSend(ctx context.Context, req *ActionRequest, jid types.JID) error {
+func (a *API) opSend(ctx context.Context, req *ActionRequest, jid types.JID) (map[string]any, error) {
 	if req.Text == "" {
-		return errors.New("text is required")
+		return nil, errors.New("text is required")
 	}
-	_, err := a.wa.SendText(ctx, jid, req.Text)
-	return err
+	id, err := a.wa.SendText(ctx, jid, req.Text)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"msg_id": id}, nil
 }
 
 func (a *API) opArchive(archive bool) opSpec {
@@ -298,6 +384,165 @@ func (a *API) opMarkRead(read bool) opSpec {
 	return opSpec{needsTarget: true, destructive: true, exec: func(ctx context.Context, _ *ActionRequest, jid types.JID) error {
 		return a.wa.MarkChatRead(ctx, jid, read)
 	}}
+}
+
+// resolveSender returns the sender JID for message ops (defaults to self).
+func (a *API) resolveSender(req *ActionRequest, chat types.JID) (types.JID, error) {
+	if req.Sender != "" {
+		return parseJID(req.Sender)
+	}
+	if me := a.wa.client.Store.ID; me != nil {
+		return me.ToNonAD(), nil
+	}
+	return chat, nil
+}
+
+func (a *API) opEditMessage(ctx context.Context, req *ActionRequest, jid types.JID) error {
+	if req.MsgID == "" || req.Text == "" {
+		return errors.New("msg_id and text are required")
+	}
+	return a.wa.EditMessage(ctx, jid, req.MsgID, req.Text)
+}
+
+func (a *API) opReact(ctx context.Context, req *ActionRequest, jid types.JID) error {
+	if req.MsgID == "" {
+		return errors.New("msg_id is required (emoji empty removes the reaction)")
+	}
+	sender, err := a.resolveSender(req, jid)
+	if err != nil {
+		return err
+	}
+	return a.wa.React(ctx, jid, sender, req.MsgID, req.Emoji)
+}
+
+func (a *API) opStar(star bool) opFunc {
+	return func(ctx context.Context, req *ActionRequest, jid types.JID) error {
+		if req.MsgID == "" {
+			return errors.New("msg_id is required")
+		}
+		sender, err := a.resolveSender(req, jid)
+		if err != nil {
+			return err
+		}
+		return a.wa.StarMessage(ctx, jid, sender, req.MsgID, req.FromMe, star)
+	}
+}
+
+func (a *API) opPin(pin bool) opFunc {
+	return func(ctx context.Context, _ *ActionRequest, jid types.JID) error {
+		return a.wa.PinChat(ctx, jid, pin)
+	}
+}
+
+func (a *API) opTyping(typing bool) opFunc {
+	return func(ctx context.Context, _ *ActionRequest, jid types.JID) error {
+		return a.wa.SetTyping(ctx, jid, typing)
+	}
+}
+
+func (a *API) opFollow(ctx context.Context, _ *ActionRequest, jid types.JID) error {
+	return a.wa.FollowNewsletter(ctx, jid)
+}
+
+func (a *API) opMuteNewsletter(mute bool) opFunc {
+	return func(ctx context.Context, _ *ActionRequest, jid types.JID) error {
+		return a.wa.MuteNewsletter(ctx, jid, mute)
+	}
+}
+
+func (a *API) opGroupCreate(ctx context.Context, req *ActionRequest, _ types.JID) (map[string]any, error) {
+	if req.Name == "" || len(req.Participants) == 0 {
+		return nil, errors.New("name and participants are required")
+	}
+	gi, err := a.wa.CreateGroup(ctx, req.Name, req.Participants)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"group_jid": gi.JID.String(), "group_name": gi.Name}, nil
+}
+
+func (a *API) opGroupLeave(ctx context.Context, _ *ActionRequest, jid types.JID) error {
+	return a.wa.LeaveGroup(ctx, jid)
+}
+
+func (a *API) opGroupParticipants(action string) opFunc {
+	return func(ctx context.Context, req *ActionRequest, jid types.JID) error {
+		if len(req.Participants) == 0 {
+			return errors.New("participants are required")
+		}
+		return a.wa.GroupParticipants(ctx, jid, action, req.Participants)
+	}
+}
+
+func (a *API) opGroupName(ctx context.Context, req *ActionRequest, jid types.JID) error {
+	if req.Name == "" {
+		return errors.New("name is required")
+	}
+	return a.wa.SetGroupName(ctx, jid, req.Name)
+}
+
+func (a *API) opGroupTopic(ctx context.Context, req *ActionRequest, jid types.JID) error {
+	return a.wa.SetGroupTopic(ctx, jid, req.Topic)
+}
+
+func (a *API) opGroupJoin(ctx context.Context, req *ActionRequest, _ types.JID) (map[string]any, error) {
+	if req.Code == "" {
+		return nil, errors.New("code (invite link/code) is required")
+	}
+	jid, err := a.wa.JoinGroup(ctx, req.Code)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"group_jid": jid.String()}, nil
+}
+
+func (a *API) opPresence(ctx context.Context, req *ActionRequest, _ types.JID) error {
+	// presence uses the "text" field as available|unavailable
+	return a.wa.SetOnline(ctx, req.Text != "unavailable")
+}
+
+func (a *API) handleJoinedGroups(w http.ResponseWriter, r *http.Request) {
+	groups, err := a.wa.client.GetJoinedGroups(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	out := make([]map[string]any, 0, len(groups))
+	for _, g := range groups {
+		out = append(out, map[string]any{
+			"jid": g.JID.String(), "name": g.Name, "participants": len(g.Participants),
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"groups": out, "count": len(out)})
+}
+
+func (a *API) handleGroupInfo(w http.ResponseWriter, r *http.Request) {
+	jid, err := parseJID(r.URL.Query().Get("chat"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	gi, err := a.wa.GroupInfo(r.Context(), jid)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, gi)
+}
+
+func (a *API) handleGroupInvite(w http.ResponseWriter, r *http.Request) {
+	jid, err := parseJID(r.URL.Query().Get("chat"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	reset := r.URL.Query().Get("reset") == "true"
+	link, err := a.wa.GroupInviteLink(r.Context(), jid, reset)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"chat": jid.String(), "invite_link": link, "reset": reset})
 }
 
 // ---- reads ----

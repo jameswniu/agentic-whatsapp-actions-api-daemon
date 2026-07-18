@@ -434,6 +434,126 @@ func (w *WAClient) SetBlocked(ctx context.Context, jid types.JID, block bool) er
 	return err
 }
 
+// ---- message-level ops ----
+
+func (w *WAClient) EditMessage(ctx context.Context, chat types.JID, msgID, newText string) error {
+	newContent := &waE2E.Message{Conversation: proto.String(newText)}
+	_, err := w.client.SendMessage(ctx, chat, w.client.BuildEdit(chat, types.MessageID(msgID), newContent))
+	return err
+}
+
+// React sets (or with empty emoji, removes) a reaction on a message.
+func (w *WAClient) React(ctx context.Context, chat, sender types.JID, msgID, emoji string) error {
+	_, err := w.client.SendMessage(ctx, chat, w.client.BuildReaction(chat, sender, types.MessageID(msgID), emoji))
+	return err
+}
+
+func (w *WAClient) StarMessage(ctx context.Context, chat, sender types.JID, msgID string, fromMe, starred bool) error {
+	return w.client.SendAppState(ctx, appstate.BuildStar(chat, sender, types.MessageID(msgID), fromMe, starred))
+}
+
+// ---- chat-level ops ----
+
+func (w *WAClient) PinChat(ctx context.Context, chat types.JID, pin bool) error {
+	return w.client.SendAppState(ctx, appstate.BuildPin(chat, pin))
+}
+
+// ---- newsletter ops ----
+
+func (w *WAClient) FollowNewsletter(ctx context.Context, jid types.JID) error {
+	return w.client.FollowNewsletter(ctx, jid)
+}
+
+func (w *WAClient) MuteNewsletter(ctx context.Context, jid types.JID, mute bool) error {
+	return w.client.NewsletterToggleMute(ctx, jid, mute)
+}
+
+// ---- presence ----
+
+func (w *WAClient) SetTyping(ctx context.Context, chat types.JID, typing bool) error {
+	state := types.ChatPresencePaused
+	if typing {
+		state = types.ChatPresenceComposing
+	}
+	return w.client.SendChatPresence(ctx, chat, state, types.ChatPresenceMediaText)
+}
+
+func (w *WAClient) SetOnline(ctx context.Context, available bool) error {
+	state := types.PresenceUnavailable
+	if available {
+		state = types.PresenceAvailable
+	}
+	return w.client.SendPresence(ctx, state)
+}
+
+// ---- group management ----
+
+func (w *WAClient) parseJIDs(inputs []string) ([]types.JID, error) {
+	out := make([]types.JID, 0, len(inputs))
+	for _, s := range inputs {
+		j, err := parseJID(s)
+		if err != nil {
+			return nil, fmt.Errorf("bad participant %q: %w", s, err)
+		}
+		out = append(out, j)
+	}
+	return out, nil
+}
+
+func (w *WAClient) CreateGroup(ctx context.Context, name string, participants []string) (*types.GroupInfo, error) {
+	jids, err := w.parseJIDs(participants)
+	if err != nil {
+		return nil, err
+	}
+	return w.client.CreateGroup(ctx, whatsmeow.ReqCreateGroup{Name: name, Participants: jids})
+}
+
+func (w *WAClient) LeaveGroup(ctx context.Context, jid types.JID) error {
+	return w.client.LeaveGroup(ctx, jid)
+}
+
+func (w *WAClient) GroupParticipants(ctx context.Context, jid types.JID, action string, participants []string) error {
+	jids, err := w.parseJIDs(participants)
+	if err != nil {
+		return err
+	}
+	var pc whatsmeow.ParticipantChange
+	switch action {
+	case "add":
+		pc = whatsmeow.ParticipantChangeAdd
+	case "remove":
+		pc = whatsmeow.ParticipantChangeRemove
+	case "promote":
+		pc = whatsmeow.ParticipantChangePromote
+	case "demote":
+		pc = whatsmeow.ParticipantChangeDemote
+	default:
+		return fmt.Errorf("unknown participant action: %s", action)
+	}
+	_, err = w.client.UpdateGroupParticipants(ctx, jid, jids, pc)
+	return err
+}
+
+func (w *WAClient) SetGroupName(ctx context.Context, jid types.JID, name string) error {
+	return w.client.SetGroupName(ctx, jid, name)
+}
+
+func (w *WAClient) SetGroupTopic(ctx context.Context, jid types.JID, topic string) error {
+	return w.client.SetGroupTopic(ctx, jid, "", "", topic)
+}
+
+func (w *WAClient) GroupInviteLink(ctx context.Context, jid types.JID, reset bool) (string, error) {
+	return w.client.GetGroupInviteLink(ctx, jid, reset)
+}
+
+func (w *WAClient) JoinGroup(ctx context.Context, code string) (types.JID, error) {
+	return w.client.JoinGroupWithLink(ctx, code)
+}
+
+func (w *WAClient) GroupInfo(ctx context.Context, jid types.JID) (*types.GroupInfo, error) {
+	return w.client.GetGroupInfo(ctx, jid)
+}
+
 func (w *WAClient) MarkChatRead(ctx context.Context, chat types.JID, read bool) error {
 	ts, key, row := w.lastMessageKey(chat)
 	if err := w.client.SendAppState(ctx, appstate.BuildMarkChatAsRead(chat, read, ts, key)); err != nil {

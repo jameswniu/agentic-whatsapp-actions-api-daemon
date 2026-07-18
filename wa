@@ -1,16 +1,45 @@
 #!/bin/zsh
-# wa — thin CLI for whatsapp-actiond-go. Emmanuel/agents call this via exec
-# instead of long curl strings. Token is read from the daemon's .env.
+# wa — CLI for whatsapp-actiond-go. Agents call this via exec instead of raw curl.
+# Token read from the daemon's .env. Destructive ops DRY-RUN unless --go is passed.
 #
-# Usage:
+# READS:
 #   wa health
 #   wa list [limit]
 #   wa messages <chat> [limit]
-#   wa send <chat> <text...>
-#   wa <op> <chat> [--go] [key=val ...]      # op = archive|unarchive|mute|unmute|
-#                                            #      delete|del-msg|block|unblock|read|unread
+#   wa group-info <chat>
+#   wa group-invite <chat> [--reset]
 #
-# Destructive ops DRY-RUN by default (prints the target preview). Add --go to execute.
+# MESSAGING:
+#   wa send <chat> <text...>
+#   wa edit <chat> <msg_id> <text...> [--go]
+#   wa react <chat> <msg_id> <emoji> [--go]        (empty emoji removes)
+#   wa del-msg <chat> <msg_id> [--go]              (revoke for everyone)
+#   wa star|unstar <chat> <msg_id> [--go]
+#
+# CHAT:
+#   wa archive|unarchive <chat> [--go]
+#   wa mute <chat> [--go] [ms]                     (ms omitted = forever)
+#   wa unmute <chat> [--go]
+#   wa pin|unpin <chat> [--go]
+#   wa read|unread <chat> [--go]
+#   wa delete <chat> [--go]                        (newsletter -> unfollow+verify)
+#   wa block|unblock <chat> [--go]
+#   wa typing|stoptyping <chat>
+#
+# NEWSLETTER:
+#   wa follow <chat> [--go]
+#   wa mute-news|unmute-news <chat> [--go]
+#
+# GROUP:
+#   wa group-create <name> <participant...> [--go]
+#   wa group-leave <chat> [--go]
+#   wa group-add|group-remove|group-promote|group-demote <chat> <participant...> [--go]
+#   wa group-name <chat> <name...> [--go]
+#   wa group-topic <chat> <topic...> [--go]
+#   wa group-join <code> [--go]
+#
+# PRESENCE:
+#   wa presence available|unavailable
 set -eu
 
 ENV_FILE="${WA_ACTIOND_DIR:-$HOME/Projects/whatsapp-actiond-go}/.env"
@@ -18,42 +47,69 @@ ENV_FILE="${WA_ACTIOND_DIR:-$HOME/Projects/whatsapp-actiond-go}/.env"
 BASE="${WA_ACTIOND_URL:-http://127.0.0.1:8788}"
 TOK="${API_TOKEN:-}"
 
-_get() { curl -s -H "X-API-Token: $TOK" "$BASE$1"; }
-_post() { curl -s -X POST -H "X-API-Token: $TOK" -H "Content-Type: application/json" -d "$2" "$BASE$1"; }
+_get()  { curl -s -H "X-API-Token: $TOK" "$BASE$1"; echo; }
+_post() { curl -s -X POST -H "X-API-Token: $TOK" -H "Content-Type: application/json" -d "$2" "$BASE$1"; echo; }
 
-# map friendly op name -> daemon endpoint
-_endpoint() {
-  case "$1" in
-    archive) echo archive;; unarchive) echo unarchive;;
-    mute) echo mute;; unmute) echo unmute;;
-    delete) echo delete_chat;; del-msg) echo delete_message;;
-    block) echo block;; unblock) echo unblock;;
-    read) echo mark_read;; unread) echo mark_unread;;
-    *) echo "";;
-  esac
+# _jb key=val ...  -> JSON object. Values: bool/number kept raw; @arr:a,b -> array; else string.
+_jb() {
+python3 - "$@" <<'PY'
+import json,sys
+NUMERIC={"duration_ms"}   # only these keys become JSON numbers; chat/etc stay strings
+o={}
+for a in sys.argv[1:]:
+    k,v=a.split("=",1)
+    if v in ("true","false"): o[k]=(v=="true")
+    elif v.startswith("@arr:"): o[k]=[x for x in v[5:].split(",") if x]
+    elif k in NUMERIC and v.lstrip("-").isdigit(): o[k]=int(v)
+    else: o[k]=v
+print(json.dumps(o))
+PY
+}
+
+# pull --go and --reset out of args; leftover positional in $REST
+# Sets GO (execute) and DRY (its inverse, the safe default) plus RESET and REST.
+_flags() {
+  GO=false; RESET=false; REST=()
+  for a in "$@"; do case "$a" in --go) GO=true;; --reset) RESET=true;; *) REST+=("$a");; esac; done
+  if [[ "$GO" == true ]]; then DRY=false; else DRY=true; fi
 }
 
 cmd="${1:-help}"; shift || true
-
 case "$cmd" in
-  health) _get /health; echo;;
-  list)   _get "/chats?limit=${1:-30}"; echo;;
-  messages) chat="$1"; _get "/messages?chat=${chat}&limit=${2:-30}"; echo;;
-  send)
-    chat="$1"; shift; text="$*"
-    _post /actions/send "$(printf '{"chat":"%s","text":"%s","dry_run":false}' "$chat" "${text//\"/\\\"}")"; echo;;
-  help|-h|--help)
-    grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
-  *)
-    ep="$(_endpoint "$cmd")"
-    [[ -z "$ep" ]] && { echo "unknown op: $cmd (try: wa help)"; exit 2; }
-    chat="$1"; shift || true
-    dry=true; extra=""
-    for a in "$@"; do
-      case "$a" in
-        --go) dry=false;;
-        *=*) k="${a%%=*}"; v="${a#*=}"; extra="$extra,\"$k\":$v";;
-      esac
-    done
-    _post "/actions/$ep" "$(printf '{"chat":"%s","dry_run":%s%s}' "$chat" "$dry" "$extra")"; echo;;
+  help|-h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+  health)  _get /health;;
+  list)    _get "/chats?limit=${1:-30}";;
+  messages) _get "/messages?chat=$1&limit=${2:-30}";;
+  group-info) _get "/group?chat=$1";;
+  group-invite) _flags "$@"; _get "/group/invite?chat=${REST[1]}&reset=$RESET";;
+
+  send)  chat="$1"; shift; _post /actions/send "$(_jb chat="$chat" text="$*" dry_run=false)";;
+  edit)  _flags "$@"; chat="${REST[1]}"; mid="${REST[2]}"; txt="${REST[@]:2}"; _post /actions/edit_message "$(_jb chat="$chat" msg_id="$mid" text="$txt" dry_run=$DRY)";;
+  react) _flags "$@"; _post /actions/react "$(_jb chat="${REST[1]}" msg_id="${REST[2]}" emoji="${REST[3]:-}" dry_run=$DRY)";;
+
+  group-create) _flags "$@"; name="${REST[1]}"; parts="${(j:,:)REST[2,-1]}"; _post /actions/group_create "$(_jb name="$name" participants=@arr:"$parts" dry_run=$DRY)";;
+  group-join)   _flags "$@"; _post /actions/group_join "$(_jb code="${REST[1]}" dry_run=$DRY)";;
+  group-add|group-remove|group-promote|group-demote)
+    _flags "$@"; chat="${REST[1]}"; parts="${(j:,:)REST[2,-1]}"; ep="group_${cmd#group-}"; _post "/actions/$ep" "$(_jb chat="$chat" participants=@arr:"$parts" dry_run=$DRY)";;
+  group-name)  _flags "$@"; chat="${REST[1]}"; _post /actions/group_name  "$(_jb chat="$chat" name="${REST[@]:1}" dry_run=$DRY)";;
+  group-topic) _flags "$@"; chat="${REST[1]}"; _post /actions/group_topic "$(_jb chat="$chat" topic="${REST[@]:1}" dry_run=$DRY)";;
+  group-leave) _flags "$@"; _post /actions/group_leave "$(_jb chat="${REST[1]}" dry_run=$DRY)";;
+
+  typing)     _post /actions/typing "$(_jb chat="$1" dry_run=false)";;
+  stoptyping) _post /actions/stop_typing "$(_jb chat="$1" dry_run=false)";;
+  presence)   _post /actions/presence "$(_jb text="${1:-available}" dry_run=false)";;
+
+  del-msg)     _flags "$@"; _post /actions/delete_message "$(_jb chat="${REST[1]}" msg_id="${REST[2]}" dry_run=$DRY)";;
+  star)        _flags "$@"; _post /actions/star   "$(_jb chat="${REST[1]}" msg_id="${REST[2]}" dry_run=$DRY)";;
+  unstar)      _flags "$@"; _post /actions/unstar "$(_jb chat="${REST[1]}" msg_id="${REST[2]}" dry_run=$DRY)";;
+  mute)        _flags "$@"; d="${REST[2]:-0}"; _post /actions/mute "$(_jb chat="${REST[1]}" duration_ms=$d dry_run=$DRY)";;
+  follow)      _flags "$@"; _post /actions/follow "$(_jb chat="${REST[1]}" dry_run=$DRY)";;
+  mute-news)   _flags "$@"; _post /actions/mute_newsletter   "$(_jb chat="${REST[1]}" dry_run=$DRY)";;
+  unmute-news) _flags "$@"; _post /actions/unmute_newsletter "$(_jb chat="${REST[1]}" dry_run=$DRY)";;
+
+  archive|unarchive|unmute|pin|unpin|read|unread|delete|block|unblock)
+    _flags "$@"; ep="$cmd"; [[ "$cmd" == read ]] && ep=mark_read; [[ "$cmd" == unread ]] && ep=mark_unread; [[ "$cmd" == delete ]] && ep=delete_chat
+    _post "/actions/$ep" "$(_jb chat="${REST[1]}" dry_run=$DRY)";;
+
+  *) echo "unknown: $cmd (wa help)"; exit 2;;
 esac
