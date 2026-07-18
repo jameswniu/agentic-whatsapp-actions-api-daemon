@@ -1,0 +1,59 @@
+#!/bin/zsh
+# wa — thin CLI for whatsapp-actiond-go. Emmanuel/agents call this via exec
+# instead of long curl strings. Token is read from the daemon's .env.
+#
+# Usage:
+#   wa health
+#   wa list [limit]
+#   wa messages <chat> [limit]
+#   wa send <chat> <text...>
+#   wa <op> <chat> [--go] [key=val ...]      # op = archive|unarchive|mute|unmute|
+#                                            #      delete|del-msg|block|unblock|read|unread
+#
+# Destructive ops DRY-RUN by default (prints the target preview). Add --go to execute.
+set -eu
+
+ENV_FILE="${WA_ACTIOND_DIR:-$HOME/Projects/whatsapp-actiond-go}/.env"
+[[ -f "$ENV_FILE" ]] && { set -a; source "$ENV_FILE"; set +a; }
+BASE="${WA_ACTIOND_URL:-http://127.0.0.1:8788}"
+TOK="${API_TOKEN:-}"
+
+_get() { curl -s -H "X-API-Token: $TOK" "$BASE$1"; }
+_post() { curl -s -X POST -H "X-API-Token: $TOK" -H "Content-Type: application/json" -d "$2" "$BASE$1"; }
+
+# map friendly op name -> daemon endpoint
+_endpoint() {
+  case "$1" in
+    archive) echo archive;; unarchive) echo unarchive;;
+    mute) echo mute;; unmute) echo unmute;;
+    delete) echo delete_chat;; del-msg) echo delete_message;;
+    block) echo block;; unblock) echo unblock;;
+    read) echo mark_read;; unread) echo mark_unread;;
+    *) echo "";;
+  esac
+}
+
+cmd="${1:-help}"; shift || true
+
+case "$cmd" in
+  health) _get /health; echo;;
+  list)   _get "/chats?limit=${1:-30}"; echo;;
+  messages) chat="$1"; _get "/messages?chat=${chat}&limit=${2:-30}"; echo;;
+  send)
+    chat="$1"; shift; text="$*"
+    _post /actions/send "$(printf '{"chat":"%s","text":"%s","dry_run":false}' "$chat" "${text//\"/\\\"}")"; echo;;
+  help|-h|--help)
+    grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+  *)
+    ep="$(_endpoint "$cmd")"
+    [[ -z "$ep" ]] && { echo "unknown op: $cmd (try: wa help)"; exit 2; }
+    chat="$1"; shift || true
+    dry=true; extra=""
+    for a in "$@"; do
+      case "$a" in
+        --go) dry=false;;
+        *=*) k="${a%%=*}"; v="${a#*=}"; extra="$extra,\"$k\":$v";;
+      esac
+    done
+    _post "/actions/$ep" "$(printf '{"chat":"%s","dry_run":%s%s}' "$chat" "$dry" "$extra")"; echo;;
+esac

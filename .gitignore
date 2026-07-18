@@ -1,0 +1,7 @@
+/actiond
+/data/
+/.env
+/logs/
+*.db
+*.db-shm
+*.db-wal

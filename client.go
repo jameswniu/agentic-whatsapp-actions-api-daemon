@@ -1,0 +1,450 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"sync/atomic"
+	"time"
+
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/mdp/qrterminal/v3"
+	"rsc.io/qr"
+
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
+	waCommon "go.mau.fi/whatsmeow/proto/waCommon"
+	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
+	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
+)
+
+// WAClient wraps whatsmeow with lifecycle state the HTTP layer can query.
+type WAClient struct {
+	cfg    *Config
+	store  *Store
+	client *whatsmeow.Client
+
+	connected        atomic.Bool
+	loggedIn         atomic.Bool
+	offlineSynced    atomic.Bool
+	connectedAt      atomic.Int64 // unix ms
+	lastEventAt      atomic.Int64 // unix ms, any event
+	historySyncCount atomic.Int64
+}
+
+func NewWAClient(cfg *Config, st *Store) (*WAClient, error) {
+	dbLog := waLog.Stdout("wmdb", "WARN", false)
+	container, err := sqlstore.New(context.Background(),
+		"sqlite3",
+		fmt.Sprintf("file:%s?_foreign_keys=on&_journal_mode=WAL", filepath.Join(cfg.DataDir, "whatsmeow.db")),
+		dbLog)
+	if err != nil {
+		return nil, fmt.Errorf("sqlstore: %w", err)
+	}
+	device, err := container.GetFirstDevice(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("get device: %w", err)
+	}
+	cli := whatsmeow.NewClient(device, waLog.Stdout("wm", "INFO", false))
+	w := &WAClient{cfg: cfg, store: st, client: cli}
+	cli.AddEventHandler(w.handleEvent)
+	return w, nil
+}
+
+func (w *WAClient) IsPaired() bool { return w.client.Store.ID != nil }
+
+// PairInteractive runs the QR flow in the foreground. Must be run from a terminal.
+func (w *WAClient) PairInteractive(ctx context.Context) error {
+	if w.IsPaired() {
+		return errors.New("already paired; delete data/whatsmeow.db to re-pair")
+	}
+	qrChan, err := w.client.GetQRChannel(ctx)
+	if err != nil {
+		return err
+	}
+	if err := w.client.Connect(); err != nil {
+		return err
+	}
+	htmlPath := filepath.Join(w.cfg.DataDir, "qr.html")
+	_ = os.WriteFile(htmlPath, []byte(`<!doctype html>
+<title>WhatsApp pairing</title>
+<body style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:95vh;font-family:sans-serif;background:#fff">
+<h2>Scan with WhatsApp &gt; Settings &gt; Linked Devices &gt; Link a Device</h2>
+<img id="q" src="qr.png" style="width:min(70vh,90vw);image-rendering:pixelated">
+<p id="s">Code refreshes live; scan any time.</p>
+<script>
+setInterval(function(){
+  var i=document.getElementById('q');
+  i.src='qr.png?t='+Date.now(); // cache-buster: always the CURRENT code
+  fetch('qr.png?h='+Date.now()).catch(function(){
+    document.getElementById('s').textContent='Pairing finished or stopped - check terminal.';
+  });
+},1500);
+</script>
+</body>`), 0o600)
+	pngPath := filepath.Join(w.cfg.DataDir, "qr.png")
+	for item := range qrChan {
+		switch item.Event {
+		case "code":
+			fmt.Fprintln(os.Stderr, "\nScan with WhatsApp > Settings > Linked Devices > Link a Device:")
+			qrterminal.GenerateHalfBlock(item.Code, qrterminal.L, os.Stderr)
+			if code, err := qr.Encode(item.Code, qr.M); err == nil {
+				_ = os.WriteFile(pngPath, code.PNG(), 0o600)
+				slog.Info("qr_png_written", "path", pngPath)
+			}
+		case "success":
+			_ = os.Remove(pngPath)
+			_ = os.Remove(htmlPath)
+			return nil
+		case "timeout":
+			return errors.New("QR timed out; run -pair again")
+		default:
+			slog.Info("qr_event", "event", item.Event)
+		}
+	}
+	return errors.New("QR channel closed before success")
+}
+
+// PairWithCode pairs via WhatsApp's 8-character code flow (no QR scan needed).
+// The user enters the code on their phone: Settings > Linked Devices >
+// Link a Device > "Link with phone number instead".
+func (w *WAClient) PairWithCode(ctx context.Context, phone string) error {
+	if w.IsPaired() {
+		return errors.New("already paired; delete data/whatsmeow.db to re-pair")
+	}
+	if err := w.client.Connect(); err != nil {
+		return err
+	}
+	code, err := w.client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (macOS)")
+	if err != nil {
+		return fmt.Errorf("pair-phone request: %w", err)
+	}
+	slog.Info("pairing_code_generated", "code", code, "phone", phone)
+	fmt.Fprintf(os.Stderr, "\n=== PAIRING CODE: %s ===\n\n", code)
+	deadline := time.Now().Add(3 * time.Minute)
+	for time.Now().Before(deadline) {
+		if w.client.IsLoggedIn() {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return errors.New("timed out waiting for code entry on phone (3m)")
+}
+
+// Start connects a previously paired session. Auto-reconnect is whatsmeow's default.
+func (w *WAClient) Start() error {
+	if !w.IsPaired() {
+		return errors.New("not paired; run with -pair first")
+	}
+	return w.client.Connect()
+}
+
+func (w *WAClient) Stop() {
+	w.client.Disconnect()
+}
+
+func (w *WAClient) handleEvent(evt any) {
+	w.lastEventAt.Store(time.Now().UnixMilli())
+	switch e := evt.(type) {
+	case *events.Connected:
+		w.connected.Store(true)
+		w.loggedIn.Store(true)
+		w.offlineSynced.Store(false)
+		w.connectedAt.Store(time.Now().UnixMilli())
+		slog.Info("wa_connected")
+	case *events.OfflineSyncCompleted:
+		w.offlineSynced.Store(true)
+		slog.Info("wa_offline_sync_completed", "count", e.Count)
+	case *events.Disconnected:
+		w.connected.Store(false)
+		w.offlineSynced.Store(false)
+		slog.Warn("wa_disconnected")
+	case *events.KeepAliveTimeout:
+		slog.Warn("wa_keepalive_timeout", "error_count", e.ErrorCount)
+	case *events.LoggedOut:
+		slog.Error("wa_logged_out", "reason", fmt.Sprintf("%v", e.Reason),
+			"note", "session invalid; exiting cleanly so launchd does NOT restart (KeepAlive.SuccessfulExit=false). Re-pair required.")
+		// Terminal state. Exit 0 so launchd treats it as a successful exit and
+		// does NOT restart — prevents a reconnect crash-loop that trips WhatsApp
+		// anti-abuse. Operator must re-pair to bring the daemon back.
+		os.Exit(0)
+	case *events.Message:
+		w.ingestMessage(e)
+	case *events.HistorySync:
+		n := w.ingestHistorySync(e)
+		w.historySyncCount.Add(int64(n))
+		slog.Info("wa_history_sync_ingested", "messages", n)
+	}
+}
+
+func (w *WAClient) ingestMessage(e *events.Message) {
+	text := extractText(e.Message)
+	err := w.store.UpsertMessage(MessageRow{
+		ChatJID:   e.Info.Chat.String(),
+		MsgID:     string(e.Info.ID),
+		SenderJID: e.Info.Sender.String(),
+		FromMe:    e.Info.IsFromMe,
+		Timestamp: e.Info.Timestamp.UnixMilli(),
+		Text:      text,
+	})
+	if err != nil {
+		slog.Error("store_upsert_message_failed", "error", err.Error())
+	}
+	_ = w.store.TouchChat(e.Info.Chat.String(), e.Info.PushName, e.Info.Timestamp.UnixMilli())
+}
+
+func (w *WAClient) ingestHistorySync(e *events.HistorySync) int {
+	n := 0
+	for _, conv := range e.Data.GetConversations() {
+		jid := conv.GetID()
+		name := conv.GetName()
+		var lastTS int64
+		for _, hmsg := range conv.GetMessages() {
+			wmi := hmsg.GetMessage()
+			if wmi == nil || wmi.GetKey() == nil {
+				continue
+			}
+			ts := int64(wmi.GetMessageTimestamp()) * 1000
+			if ts > lastTS {
+				lastTS = ts
+			}
+			text := ""
+			if m := wmi.GetMessage(); m != nil {
+				text = extractText(m)
+			}
+			sender := jid
+			if p := wmi.GetParticipant(); p != "" {
+				sender = p
+			}
+			err := w.store.UpsertMessage(MessageRow{
+				ChatJID:   jid,
+				MsgID:     wmi.GetKey().GetID(),
+				SenderJID: sender,
+				FromMe:    wmi.GetKey().GetFromMe(),
+				Timestamp: ts,
+				Text:      text,
+			})
+			if err == nil {
+				n++
+			}
+		}
+		_ = w.store.TouchChat(jid, name, lastTS)
+	}
+	return n
+}
+
+func extractText(m *waE2E.Message) string {
+	if m == nil {
+		return ""
+	}
+	// Unwrap containers: self-chat sends arrive as DeviceSentMessage,
+	// disappearing-mode chats wrap in EphemeralMessage.
+	if ds := m.GetDeviceSentMessage(); ds != nil && ds.GetMessage() != nil {
+		return extractText(ds.GetMessage())
+	}
+	if em := m.GetEphemeralMessage(); em != nil && em.GetMessage() != nil {
+		return extractText(em.GetMessage())
+	}
+	if t := m.GetConversation(); t != "" {
+		return t
+	}
+	if et := m.GetExtendedTextMessage(); et != nil {
+		return et.GetText()
+	}
+	if im := m.GetImageMessage(); im != nil {
+		return "[image] " + im.GetCaption()
+	}
+	if vm := m.GetVideoMessage(); vm != nil {
+		return "[video] " + vm.GetCaption()
+	}
+	if m.GetAudioMessage() != nil {
+		return "[audio]"
+	}
+	if dm := m.GetDocumentMessage(); dm != nil {
+		return "[document] " + dm.GetFileName()
+	}
+	if m.GetStickerMessage() != nil {
+		return "[sticker]"
+	}
+	return ""
+}
+
+// ---- readiness gates ----
+
+var (
+	ErrNotConnected = errors.New("whatsapp connection is down")
+	ErrNotSynced    = errors.New("post-reconnect sync incomplete; destructive ops gated")
+)
+
+// WaitConnected blocks up to timeout for the socket to be up.
+func (w *WAClient) WaitConnected(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if w.client.IsConnected() {
+			return nil
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return ErrNotConnected
+}
+
+// DestructiveReady enforces the accuracy gate: after a (re)connect, destructive
+// app-state ops wait for OfflineSyncCompleted, or a grace period as fallback.
+func (w *WAClient) DestructiveReady() error {
+	if !w.client.IsConnected() {
+		return ErrNotConnected
+	}
+	if w.offlineSynced.Load() {
+		return nil
+	}
+	connAt := w.connectedAt.Load()
+	if connAt > 0 && time.Since(time.UnixMilli(connAt)) > w.cfg.OfflineSyncGracePeriod {
+		return nil
+	}
+	return ErrNotSynced
+}
+
+// ---- op primitives (no gates here; gates live in actions.go) ----
+
+func (w *WAClient) lastMessageKey(chatJID types.JID) (time.Time, *waCommon.MessageKey, *MessageRow) {
+	row, err := w.store.LastMessage(chatJID.String())
+	if err != nil || row == nil {
+		return time.Time{}, nil, nil
+	}
+	key := &waCommon.MessageKey{
+		RemoteJID: proto.String(row.ChatJID),
+		FromMe:    proto.Bool(row.FromMe),
+		ID:        proto.String(row.MsgID),
+	}
+	return time.UnixMilli(row.Timestamp), key, row
+}
+
+// ResolveName returns a best-effort display name for a chat JID by consulting
+// whatsmeow's contact store (synced from the phone's address book + push names),
+// resolving @lid privacy IDs to phone numbers first, and group subjects for groups.
+// Returns "" when nothing better than the raw ID is known.
+func (w *WAClient) ResolveName(jidStr string) string {
+	jid, err := types.ParseJID(jidStr)
+	if err != nil {
+		return ""
+	}
+	ctx := context.Background()
+
+	switch jid.Server {
+	case types.GroupServer:
+		if gi, err := w.client.GetGroupInfo(ctx, jid); err == nil && gi != nil && gi.Name != "" {
+			return gi.Name
+		}
+		return ""
+	case types.BroadcastServer:
+		if jid.User == "status" {
+			return "Status Updates"
+		}
+	case types.NewsletterServer:
+		if ni, err := w.client.GetNewsletterInfo(ctx, jid); err == nil && ni != nil && ni.ThreadMeta.Name.Text != "" {
+			return ni.ThreadMeta.Name.Text
+		}
+		return ""
+	}
+
+	// Resolve @lid -> phone JID so the contact lookup can hit.
+	lookup := jid
+	if jid.Server == types.HiddenUserServer {
+		if pn, err := w.client.Store.LIDs.GetPNForLID(ctx, jid); err == nil && !pn.IsEmpty() {
+			lookup = pn
+		}
+	}
+	if info, err := w.client.Store.Contacts.GetContact(ctx, lookup); err == nil && info.Found {
+		switch {
+		case info.FullName != "":
+			return info.FullName
+		case info.FirstName != "":
+			return info.FirstName
+		case info.PushName != "":
+			return info.PushName
+		case info.BusinessName != "":
+			return info.BusinessName
+		}
+	}
+	return ""
+}
+
+func (w *WAClient) SendText(ctx context.Context, to types.JID, text string) (string, error) {
+	resp, err := w.client.SendMessage(ctx, to, &waE2E.Message{Conversation: proto.String(text)})
+	if err != nil {
+		return "", err
+	}
+	return string(resp.ID), nil
+}
+
+func (w *WAClient) Archive(ctx context.Context, chat types.JID, archive bool) error {
+	ts, key, _ := w.lastMessageKey(chat)
+	return w.client.SendAppState(ctx, appstate.BuildArchive(chat, archive, ts, key))
+}
+
+func (w *WAClient) Mute(ctx context.Context, chat types.JID, mute bool, duration time.Duration) error {
+	return w.client.SendAppState(ctx, appstate.BuildMute(chat, mute, duration))
+}
+
+func (w *WAClient) DeleteChat(ctx context.Context, chat types.JID, deleteMedia bool) error {
+	// Newsletters are unfollowed, not deleted; a DeleteChatAction patch is a no-op for them.
+	if chat.Server == types.NewsletterServer {
+		if err := w.client.UnfollowNewsletter(ctx, chat); err != nil {
+			return fmt.Errorf("unfollow newsletter: %w", err)
+		}
+		// Verify the unfollow actually took effect (guards against silent no-ops).
+		if subs, err := w.client.GetSubscribedNewsletters(ctx); err == nil {
+			for _, n := range subs {
+				if n != nil && n.ID.String() == chat.String() {
+					return fmt.Errorf("unfollow reported ok but newsletter still subscribed: %s", chat.String())
+				}
+			}
+		}
+	} else {
+		ts, key, _ := w.lastMessageKey(chat)
+		if err := w.client.SendAppState(ctx, appstate.BuildDeleteChat(chat, ts, key, deleteMedia)); err != nil {
+			return err
+		}
+	}
+	// Prune the local index so readback is immediately consistent with the mutation.
+	if err := w.store.RemoveChat(chat.String()); err != nil {
+		slog.Warn("delete_chat_local_prune_failed", "chat", chat.String(), "error", err.Error())
+	}
+	return nil
+}
+
+func (w *WAClient) RevokeMessage(ctx context.Context, chat, sender types.JID, msgID string) error {
+	_, err := w.client.SendMessage(ctx, chat, w.client.BuildRevoke(chat, sender, types.MessageID(msgID)))
+	return err
+}
+
+func (w *WAClient) SetBlocked(ctx context.Context, jid types.JID, block bool) error {
+	action := events.BlocklistChangeActionBlock
+	if !block {
+		action = events.BlocklistChangeActionUnblock
+	}
+	_, err := w.client.UpdateBlocklist(ctx, jid, action)
+	return err
+}
+
+func (w *WAClient) MarkChatRead(ctx context.Context, chat types.JID, read bool) error {
+	ts, key, row := w.lastMessageKey(chat)
+	if err := w.client.SendAppState(ctx, appstate.BuildMarkChatAsRead(chat, read, ts, key)); err != nil {
+		return err
+	}
+	// Best-effort read receipt for the latest inbound message; failure is non-fatal.
+	if read && row != nil && !row.FromMe {
+		sender, err := types.ParseJID(row.SenderJID)
+		if err == nil {
+			_ = w.client.MarkRead(ctx, []types.MessageID{types.MessageID(row.MsgID)}, time.Now(), chat, sender)
+		}
+	}
+	return nil
+}
