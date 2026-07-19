@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -94,6 +95,8 @@ func (a *API) Routes() http.Handler {
 		opSpec{needsTarget: true, exec: a.opGroupName})))
 	mux.HandleFunc("POST /actions/group_topic", a.auth(a.action("group_topic",
 		opSpec{needsTarget: true, exec: a.opGroupTopic})))
+	mux.HandleFunc("POST /actions/group_photo", a.auth(a.action("group_photo",
+		opSpec{needsTarget: true, exec: a.opGroupPhoto})))
 	mux.HandleFunc("POST /actions/group_join", a.auth(a.action("group_join",
 		opSpec{needsTarget: false, execR: a.opGroupJoin})))
 
@@ -149,6 +152,7 @@ type ActionRequest struct {
 	Topic        string   `json:"topic"`
 	Code         string   `json:"code"`
 	Reset        bool     `json:"reset"`
+	ImagePath    string   `json:"image_path"` // group_photo: path to a JPEG on disk
 
 	DryRun         *bool  `json:"dry_run"`
 	IdempotencyKey string `json:"idempotency_key"`
@@ -520,6 +524,18 @@ func (a *API) opGroupName(ctx context.Context, req *ActionRequest, jid types.JID
 
 func (a *API) opGroupTopic(ctx context.Context, req *ActionRequest, jid types.JID) error {
 	return a.wa.SetGroupTopic(ctx, jid, req.Topic)
+}
+
+func (a *API) opGroupPhoto(ctx context.Context, req *ActionRequest, jid types.JID) error {
+	if req.ImagePath == "" {
+		return errors.New("image_path is required (path to a JPEG)")
+	}
+	img, err := os.ReadFile(req.ImagePath)
+	if err != nil {
+		return fmt.Errorf("read image: %w", err)
+	}
+	_, err = a.wa.SetGroupPhoto(ctx, jid, img)
+	return err
 }
 
 func (a *API) opGroupJoin(ctx context.Context, req *ActionRequest, _ types.JID) (map[string]any, error) {

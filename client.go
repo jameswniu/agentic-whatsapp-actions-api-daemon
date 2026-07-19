@@ -612,6 +612,11 @@ func (w *WAClient) GroupInfo(ctx context.Context, jid types.JID) (*types.GroupIn
 	return w.client.GetGroupInfo(ctx, jid)
 }
 
+// SetGroupPhoto sets a group's profile photo. avatar must be a JPEG; pass nil to remove.
+func (w *WAClient) SetGroupPhoto(ctx context.Context, jid types.JID, avatar []byte) (string, error) {
+	return w.client.SetGroupPhoto(ctx, jid, avatar)
+}
+
 func (w *WAClient) MarkChatRead(ctx context.Context, chat types.JID, read bool) error {
 	ts, key, row := w.lastMessageKey(chat)
 	if err := w.client.SendAppState(ctx, appstate.BuildMarkChatAsRead(chat, read, ts, key)); err != nil {
