@@ -10,7 +10,10 @@
 #   wa group-invite <chat> [--reset]
 #
 # MESSAGING:
-#   wa send <chat> <text...>
+#   wa send-audio <chat> <file.mp3> [seconds]     (playable audio; no caption field)
+#   wa send <chat> <text...> [--mention <jid|number>]...
+#     A real @tag needs BOTH: "@<number>" inside the text AND --mention for that
+#     person. Text alone renders as plain characters and notifies nobody.
 #   wa edit <chat> <msg_id> <text...> [--go]
 #   wa react <chat> <msg_id> <emoji> [--go]        (empty emoji removes)
 #   wa del-msg <chat> <msg_id> [--go]              (revoke for everyone)
@@ -54,7 +57,7 @@ _post() { curl -s -X POST -H "X-API-Token: $TOK" -H "Content-Type: application/j
 _jb() {
 python3 - "$@" <<'PY'
 import json,sys
-NUMERIC={"duration_ms"}   # only these keys become JSON numbers; chat/etc stay strings
+NUMERIC={"duration_ms","seconds"}   # only these keys become JSON numbers; chat/etc stay strings
 o={}
 for a in sys.argv[1:]:
     k,v=a.split("=",1)
@@ -78,12 +81,28 @@ cmd="${1:-help}"; shift || true
 case "$cmd" in
   help|-h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
   health)  _get /health;;
+  pair)    _post /actions/pair "{\"phone\": \"${1:-}\"}";;
   list)    _get "/chats?limit=${1:-30}";;
   messages) _get "/messages?chat=$1&limit=${2:-30}";;
   group-info) _get "/group?chat=$1";;
   group-invite) _flags "$@"; _get "/group/invite?chat=${REST[1]}&reset=$RESET";;
 
-  send)  chat="$1"; shift; _post /actions/send "$(_jb chat="$chat" text="$*" dry_run=false)";;
+  send-audio) chat="$1"; shift; media="$1"; shift
+         _post /actions/send_audio "$(_jb chat="$chat" media="$media" seconds="${1:-0}" dry_run=false)";;
+
+  send)  chat="$1"; shift
+         MENTIONS=""; TEXT=()
+         while [[ $# -gt 0 ]]; do
+           case "$1" in
+             --mention) MENTIONS="${MENTIONS:+$MENTIONS,}${2:-}"; shift 2;;
+             *) TEXT+=("$1"); shift;;
+           esac
+         done
+         if [[ -n "$MENTIONS" ]]; then
+           _post /actions/send "$(_jb chat="$chat" text="${TEXT[*]}" mentions="@arr:$MENTIONS" dry_run=false)"
+         else
+           _post /actions/send "$(_jb chat="$chat" text="${TEXT[*]}" dry_run=false)"
+         fi;;
   edit)  _flags "$@"; chat="${REST[1]}"; mid="${REST[2]}"; txt="${REST[@]:2}"; _post /actions/edit_message "$(_jb chat="$chat" msg_id="$mid" text="$txt" dry_run=$DRY)";;
   react) _flags "$@"; _post /actions/react "$(_jb chat="${REST[1]}" msg_id="${REST[2]}" emoji="${REST[3]:-}" dry_run=$DRY)";;
 

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -170,11 +171,15 @@ func (w *WAClient) handleEvent(evt any) {
 		slog.Warn("wa_keepalive_timeout", "error_count", e.ErrorCount)
 	case *events.LoggedOut:
 		slog.Error("wa_logged_out", "reason", fmt.Sprintf("%v", e.Reason),
-			"note", "session invalid; exiting cleanly so launchd does NOT restart (KeepAlive.SuccessfulExit=false). Re-pair required.")
-		// Terminal state. Exit 0 so launchd treats it as a successful exit and
-		// does NOT restart — prevents a reconnect crash-loop that trips WhatsApp
-		// anti-abuse. Operator must re-pair to bring the daemon back.
-		os.Exit(0)
+			"note", "session invalid; disconnecting and awaiting re-pair via POST /actions/pair. No reconnect attempts (anti-abuse).")
+		// Stay alive but idle: disconnect so whatsmeow makes no reconnect
+		// attempts (avoids tripping WhatsApp anti-abuse), keep serving HTTP so
+		// re-pairing can be triggered remotely (Emmanuel relaying the 8-char
+		// code over Telegram). whatsmeow deletes the dead session itself on
+		// LoggedOut, so IsPaired() turns false and /actions/pair is unblocked.
+		w.connected.Store(false)
+		w.loggedIn.Store(false)
+		go w.client.Disconnect()
 	case *events.Message:
 		w.ingestMessage(e)
 	case *events.HistorySync:
@@ -377,7 +382,60 @@ func (w *WAClient) ResolveName(jidStr string) string {
 }
 
 func (w *WAClient) SendText(ctx context.Context, to types.JID, text string) (string, error) {
-	resp, err := w.client.SendMessage(ctx, to, &waE2E.Message{Conversation: proto.String(text)})
+	return w.SendTextWithMentions(ctx, to, text, nil)
+}
+
+// SendTextWithMentions sends text that can @-tag participants. A real WhatsApp
+// mention needs BOTH halves: the literal "@<number>" in the body AND the tagged
+// JID in ContextInfo.MentionedJID. Text alone renders as plain characters and
+// notifies nobody, which is why plain Conversation messages cannot tag.
+func (w *WAClient) SendTextWithMentions(ctx context.Context, to types.JID, text string, mentions []string) (string, error) {
+	if len(mentions) == 0 {
+		resp, err := w.client.SendMessage(ctx, to, &waE2E.Message{Conversation: proto.String(text)})
+		if err != nil {
+			return "", err
+		}
+		return string(resp.ID), nil
+	}
+	msg := &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+		Text:        proto.String(text),
+		ContextInfo: &waE2E.ContextInfo{MentionedJID: mentions},
+	}}
+	resp, err := w.client.SendMessage(ctx, to, msg)
+	if err != nil {
+		return "", err
+	}
+	return string(resp.ID), nil
+}
+
+// SendAudio uploads a local audio file and sends it as a playable audio message.
+// WhatsApp's AudioMessage has no caption field, so any accompanying text must be
+// sent as its own message.
+func (w *WAClient) SendAudio(ctx context.Context, to types.JID, path string, seconds uint32) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read audio: %w", err)
+	}
+	up, err := w.client.Upload(ctx, data, whatsmeow.MediaAudio)
+	if err != nil {
+		return "", fmt.Errorf("upload audio: %w", err)
+	}
+	mime := "audio/mpeg"
+	if strings.HasSuffix(strings.ToLower(path), ".ogg") {
+		mime = "audio/ogg; codecs=opus"
+	}
+	msg := &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
+		URL:           proto.String(up.URL),
+		DirectPath:    proto.String(up.DirectPath),
+		MediaKey:      up.MediaKey,
+		Mimetype:      proto.String(mime),
+		FileEncSHA256: up.FileEncSHA256,
+		FileSHA256:    up.FileSHA256,
+		FileLength:    proto.Uint64(up.FileLength),
+		Seconds:       proto.Uint32(seconds),
+		PTT:           proto.Bool(false),
+	}}
+	resp, err := w.client.SendMessage(ctx, to, msg)
 	if err != nil {
 		return "", err
 	}
@@ -567,4 +625,23 @@ func (w *WAClient) MarkChatRead(ctx context.Context, chat types.JID, read bool) 
 		}
 	}
 	return nil
+}
+
+// PairForCode requests an 8-char pairing code and returns it immediately.
+// Login completes asynchronously when the user enters the code on the phone
+// (whatsmeow handles the handshake via its event loop). Added for the
+// /actions/pair endpoint so Emmanuel can relay the code over Telegram.
+func (w *WAClient) PairForCode(ctx context.Context, phone string) (string, error) {
+	if w.IsPaired() {
+		return "", errors.New("already paired; delete data/whatsmeow.db to re-pair")
+	}
+	if err := w.client.Connect(); err != nil {
+		return "", err
+	}
+	code, err := w.client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (macOS)")
+	if err != nil {
+		return "", fmt.Errorf("pair-phone request: %w", err)
+	}
+	slog.Info("pairing_code_generated", "code", code, "phone", phone)
+	return code, nil
 }

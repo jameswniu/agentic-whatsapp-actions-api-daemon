@@ -27,10 +27,13 @@ func (a *API) Routes() http.Handler {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", a.handleHealth)
+	mux.HandleFunc("POST /actions/pair", a.auth(a.handlePair))
 	mux.HandleFunc("GET /chats", a.auth(a.handleListChats))
 	mux.HandleFunc("GET /messages", a.auth(a.handleGetMessages))
 	mux.HandleFunc("GET /actions/{id}", a.auth(a.handleGetAction))
 
+	mux.HandleFunc("POST /actions/send_audio", a.auth(a.action("send_audio",
+		opSpec{needsTarget: true, execR: a.opSendAudio})))
 	mux.HandleFunc("POST /actions/send", a.auth(a.action("send",
 		opSpec{needsTarget: true, execR: a.opSend})))
 	mux.HandleFunc("POST /actions/archive", a.auth(a.action("archive", a.opArchive(true))))
@@ -98,6 +101,8 @@ func (a *API) Routes() http.Handler {
 	mux.HandleFunc("POST /actions/presence", a.auth(a.action("presence",
 		opSpec{needsTarget: false, exec: a.opPresence})))
 
+	// reads
+	mux.HandleFunc("GET /blocklist", a.auth(a.handleBlocklist))
 	// group reads
 	mux.HandleFunc("GET /groups", a.auth(a.handleJoinedGroups))
 	mux.HandleFunc("GET /group", a.auth(a.handleGroupInfo))
@@ -132,7 +137,10 @@ type ActionRequest struct {
 	DeleteMedia bool   `json:"delete_media"`
 
 	// message/chat extras
-	Emoji  string `json:"emoji"`
+	Mentions []string `json:"mentions"`
+	Media    string   `json:"media"`
+	Seconds  uint32   `json:"seconds"`
+	Emoji    string   `json:"emoji"`
 	FromMe bool   `json:"from_me"`
 
 	// group extras
@@ -330,11 +338,40 @@ func previewMsg(m *MessageRow) map[string]any {
 
 // ---- ops ----
 
+// normalizeMentions turns bare numbers ("19995550000") into full JIDs. Values
+// that already carry a server (@s.whatsapp.net, @lid) pass through untouched,
+// so LID-addressed groups can be tagged by their LID.
+func normalizeMentions(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, m := range in {
+		m = strings.TrimSpace(strings.TrimPrefix(m, "@"))
+		if m == "" {
+			continue
+		}
+		if !strings.Contains(m, "@") {
+			m += "@s.whatsapp.net"
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func (a *API) opSendAudio(ctx context.Context, req *ActionRequest, jid types.JID) (map[string]any, error) {
+	if req.Media == "" {
+		return nil, errors.New("media (path to audio file) is required")
+	}
+	id, err := a.wa.SendAudio(ctx, jid, req.Media, req.Seconds)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"msg_id": id}, nil
+}
+
 func (a *API) opSend(ctx context.Context, req *ActionRequest, jid types.JID) (map[string]any, error) {
 	if req.Text == "" {
 		return nil, errors.New("text is required")
 	}
-	id, err := a.wa.SendText(ctx, jid, req.Text)
+	id, err := a.wa.SendTextWithMentions(ctx, jid, req.Text, normalizeMentions(req.Mentions))
 	if err != nil {
 		return nil, err
 	}
@@ -499,6 +536,19 @@ func (a *API) opGroupJoin(ctx context.Context, req *ActionRequest, _ types.JID) 
 func (a *API) opPresence(ctx context.Context, req *ActionRequest, _ types.JID) error {
 	// presence uses the "text" field as available|unavailable
 	return a.wa.SetOnline(ctx, req.Text != "unavailable")
+}
+
+func (a *API) handleBlocklist(w http.ResponseWriter, r *http.Request) {
+	bl, err := a.wa.client.GetBlocklist(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	out := make([]map[string]any, 0, len(bl.JIDs))
+	for _, j := range bl.JIDs {
+		out = append(out, map[string]any{"jid": j.String(), "name": a.wa.ResolveName(j.String())})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"blocked": out, "count": len(out)})
 }
 
 func (a *API) handleJoinedGroups(w http.ResponseWriter, r *http.Request) {
@@ -675,4 +725,26 @@ func queryInt(r *http.Request, key string, def, max int) int {
 		return max
 	}
 	return n
+}
+
+func (a *API) handlePair(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Phone string `json:"phone"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	phone := strings.TrimPrefix(strings.TrimSpace(body.Phone), "+")
+	if phone == "" {
+		phone = "19995550000" // James's number; override via body.phone
+	}
+	code, err := a.wa.PairForCode(r.Context(), phone)
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":    true,
+		"code":  code,
+		"phone": phone,
+		"hint":  "Enter the code on the phone: WhatsApp > Linked Devices > Link a Device > Link with phone number instead. Code valid a few minutes.",
+	})
 }
