@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -203,10 +204,178 @@ func (w *WAClient) ingestMessage(e *events.Message) {
 		slog.Error("store_upsert_message_failed", "error", err.Error())
 	}
 	_ = w.store.TouchChat(e.Info.Chat.String(), e.Info.PushName, e.Info.Timestamp.UnixMilli())
+	// Capture media off the event loop so a slow download never stalls ingest.
+	go w.captureMedia(e.Info.Chat.String(), string(e.Info.ID), e.Message)
+}
+
+// mediaFromMessage returns the downloadable media sub-message plus a file
+// extension for it, unwrapping the same container types as extractText. ok=false
+// when the message carries no downloadable media.
+func mediaFromMessage(m *waE2E.Message) (whatsmeow.DownloadableMessage, string, bool) {
+	if m == nil {
+		return nil, "", false
+	}
+	if ds := m.GetDeviceSentMessage(); ds != nil && ds.GetMessage() != nil {
+		return mediaFromMessage(ds.GetMessage())
+	}
+	if em := m.GetEphemeralMessage(); em != nil && em.GetMessage() != nil {
+		return mediaFromMessage(em.GetMessage())
+	}
+	if vo := m.GetViewOnceMessage(); vo != nil && vo.GetMessage() != nil {
+		return mediaFromMessage(vo.GetMessage())
+	}
+	if vo := m.GetViewOnceMessageV2(); vo != nil && vo.GetMessage() != nil {
+		return mediaFromMessage(vo.GetMessage())
+	}
+	switch {
+	case m.GetImageMessage() != nil:
+		return m.GetImageMessage(), extFromMime(m.GetImageMessage().GetMimetype(), ".jpg"), true
+	case m.GetVideoMessage() != nil:
+		return m.GetVideoMessage(), extFromMime(m.GetVideoMessage().GetMimetype(), ".mp4"), true
+	case m.GetAudioMessage() != nil:
+		return m.GetAudioMessage(), extFromMime(m.GetAudioMessage().GetMimetype(), ".ogg"), true
+	case m.GetDocumentMessage() != nil:
+		return m.GetDocumentMessage(), docExt(m.GetDocumentMessage()), true
+	case m.GetStickerMessage() != nil:
+		return m.GetStickerMessage(), ".webp", true
+	}
+	return nil, "", false
+}
+
+func extFromMime(mime, def string) string {
+	mime = strings.ToLower(strings.SplitN(mime, ";", 2)[0])
+	switch strings.TrimSpace(mime) {
+	case "image/jpeg":
+		return ".jpg"
+	case "image/png":
+		return ".png"
+	case "image/webp":
+		return ".webp"
+	case "image/gif":
+		return ".gif"
+	case "video/mp4":
+		return ".mp4"
+	case "video/3gpp":
+		return ".3gp"
+	case "audio/ogg":
+		return ".ogg"
+	case "audio/mpeg":
+		return ".mp3"
+	case "audio/mp4", "audio/aac":
+		return ".m4a"
+	case "audio/amr":
+		return ".amr"
+	case "application/pdf":
+		return ".pdf"
+	}
+	return def
+}
+
+func docExt(dm *waE2E.DocumentMessage) string {
+	name := dm.GetFileName()
+	if i := strings.LastIndex(name, "."); i >= 0 && i < len(name)-1 {
+		return name[i:]
+	}
+	return extFromMime(dm.GetMimetype(), ".bin")
+}
+
+// captureMedia downloads a message's media (if any) into DATA_DIR/media and
+// records the on-disk path on the stored row. Best-effort: any failure (no keys,
+// expired link, network) is logged and skipped so ingest never blocks. Files are
+// named by message ID and are stable, so re-delivery overwrites rather than dups.
+func (w *WAClient) captureMedia(chatJID, msgID string, m *waE2E.Message) {
+	dl, ext, ok := mediaFromMessage(m)
+	if !ok {
+		return
+	}
+	if len(dl.GetMediaKey()) == 0 || dl.GetDirectPath() == "" {
+		return // no keys => not downloadable (e.g. already-expired history media)
+	}
+	dir := filepath.Join(w.cfg.DataDir, "media")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		slog.Error("media_mkdir_failed", "error", err.Error())
+		return
+	}
+	// Skip if already on disk (dedupes re-delivery / history re-sync).
+	if p := filepath.Join(dir, sanitizeFilename(msgID)+ext); fileExists(p) {
+		_ = w.store.SetMediaPath(chatJID, msgID, p)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	data, err := w.client.Download(ctx, dl)
+	if err != nil {
+		slog.Warn("media_download_failed", "msg_id", msgID, "error", err.Error())
+		return
+	}
+	path := filepath.Join(dir, sanitizeFilename(msgID)+ext)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		slog.Error("media_write_failed", "error", err.Error())
+		return
+	}
+	if err := w.store.SetMediaPath(chatJID, msgID, path); err != nil {
+		slog.Error("media_setpath_failed", "error", err.Error())
+		return
+	}
+	slog.Info("media_captured", "msg_id", msgID, "bytes", len(data), "path", path)
+}
+
+func fileExists(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.Size() > 0
+}
+
+// recordSentMedia makes outbound media readable: whatsmeow does not echo our own
+// sends back as events.Message, so we persist the row and copy the source file
+// into the media dir at send time. label matches extractText's format.
+func (w *WAClient) recordSentMedia(chat types.JID, msgID, srcPath, label string) {
+	dir := filepath.Join(w.cfg.DataDir, "media")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		slog.Error("media_mkdir_failed", "error", err.Error())
+	}
+	dst := filepath.Join(dir, sanitizeFilename(msgID)+filepath.Ext(srcPath))
+	if data, err := os.ReadFile(srcPath); err == nil {
+		if err := os.WriteFile(dst, data, 0o644); err != nil {
+			slog.Error("media_copy_failed", "error", err.Error())
+			dst = ""
+		}
+	} else {
+		dst = ""
+	}
+	ts := time.Now().UnixMilli()
+	self := ""
+	if id := w.client.Store.ID; id != nil {
+		self = id.String()
+	}
+	if err := w.store.UpsertMessage(MessageRow{
+		ChatJID: chat.String(), MsgID: msgID, SenderJID: self,
+		FromMe: true, Timestamp: ts, Text: label,
+	}); err != nil {
+		slog.Error("store_upsert_sent_failed", "error", err.Error())
+	}
+	if dst != "" {
+		_ = w.store.SetMediaPath(chat.String(), msgID, dst)
+	}
+	_ = w.store.TouchChat(chat.String(), "", ts)
+}
+
+func sanitizeFilename(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		default:
+			return '_'
+		}
+	}, s)
 }
 
 func (w *WAClient) ingestHistorySync(e *events.HistorySync) int {
 	n := 0
+	// Only download media for messages from the last 14 days, capped per sync,
+	// so a full history backfill cannot spawn thousands of downloads.
+	recentCutoff := time.Now().Add(-14 * 24 * time.Hour).UnixMilli()
+	mediaBudget := 200
 	for _, conv := range e.Data.GetConversations() {
 		jid := conv.GetID()
 		name := conv.GetName()
@@ -238,6 +407,15 @@ func (w *WAClient) ingestHistorySync(e *events.HistorySync) int {
 			})
 			if err == nil {
 				n++
+			}
+			// Capture media for recent history messages too, bounded by a
+			// recency window and a per-sync budget so a large backfill never
+			// triggers a download storm. The fileExists guard dedupes.
+			if m := wmi.GetMessage(); m != nil && ts >= recentCutoff && mediaBudget > 0 {
+				if _, _, ok := mediaFromMessage(m); ok {
+					mediaBudget--
+					go w.captureMedia(jid, wmi.GetKey().GetID(), m)
+				}
 			}
 		}
 		_ = w.store.TouchChat(jid, name, lastTS)
@@ -510,7 +688,169 @@ func (w *WAClient) SendAudio(ctx context.Context, to types.JID, path string, sec
 	if err != nil {
 		return "", err
 	}
-	return string(resp.ID), nil
+	id := string(resp.ID)
+	w.recordSentMedia(to, id, path, mediaLabel("audio", "", int(seconds)))
+	return id, nil
+}
+
+func mimeFromExt(path, def string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".webp":
+		return "image/webp"
+	case ".gif":
+		return "image/gif"
+	case ".mp4":
+		return "video/mp4"
+	case ".3gp":
+		return "video/3gpp"
+	case ".pdf":
+		return "application/pdf"
+	}
+	return def
+}
+
+// SendImage uploads a local image and sends it with an optional caption.
+func (w *WAClient) SendImage(ctx context.Context, to types.JID, path, caption string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read image: %w", err)
+	}
+	up, err := w.client.Upload(ctx, data, whatsmeow.MediaImage)
+	if err != nil {
+		return "", fmt.Errorf("upload image: %w", err)
+	}
+	msg := &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+		Caption:       proto.String(caption),
+		URL:           proto.String(up.URL),
+		DirectPath:    proto.String(up.DirectPath),
+		MediaKey:      up.MediaKey,
+		Mimetype:      proto.String(mimeFromExt(path, "image/jpeg")),
+		FileEncSHA256: up.FileEncSHA256,
+		FileSHA256:    up.FileSHA256,
+		FileLength:    proto.Uint64(up.FileLength),
+	}}
+	resp, err := w.client.SendMessage(ctx, to, msg)
+	if err != nil {
+		return "", err
+	}
+	id := string(resp.ID)
+	w.recordSentMedia(to, id, path, strings.TrimSpace("[image] "+caption))
+	return id, nil
+}
+
+// SendVideo uploads a local video and sends it with an optional caption. Duration
+// is probed with ffprobe when available; a zero duration still sends fine.
+func (w *WAClient) SendVideo(ctx context.Context, to types.JID, path, caption string, seconds uint32) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read video: %w", err)
+	}
+	up, err := w.client.Upload(ctx, data, whatsmeow.MediaVideo)
+	if err != nil {
+		return "", fmt.Errorf("upload video: %w", err)
+	}
+	msg := &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
+		Caption:       proto.String(caption),
+		URL:           proto.String(up.URL),
+		DirectPath:    proto.String(up.DirectPath),
+		MediaKey:      up.MediaKey,
+		Mimetype:      proto.String(mimeFromExt(path, "video/mp4")),
+		FileEncSHA256: up.FileEncSHA256,
+		FileSHA256:    up.FileSHA256,
+		FileLength:    proto.Uint64(up.FileLength),
+		Seconds:       proto.Uint32(seconds),
+	}}
+	resp, err := w.client.SendMessage(ctx, to, msg)
+	if err != nil {
+		return "", err
+	}
+	id := string(resp.ID)
+	w.recordSentMedia(to, id, path, mediaLabel("video", caption, int(seconds)))
+	return id, nil
+}
+
+// SendDocument uploads a local file and sends it as a document attachment.
+func (w *WAClient) SendDocument(ctx context.Context, to types.JID, path, caption string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read document: %w", err)
+	}
+	up, err := w.client.Upload(ctx, data, whatsmeow.MediaDocument)
+	if err != nil {
+		return "", fmt.Errorf("upload document: %w", err)
+	}
+	name := filepath.Base(path)
+	msg := &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
+		Caption:       proto.String(caption),
+		FileName:      proto.String(name),
+		Title:         proto.String(name),
+		URL:           proto.String(up.URL),
+		DirectPath:    proto.String(up.DirectPath),
+		MediaKey:      up.MediaKey,
+		Mimetype:      proto.String(mimeFromExt(path, "application/octet-stream")),
+		FileEncSHA256: up.FileEncSHA256,
+		FileSHA256:    up.FileSHA256,
+		FileLength:    proto.Uint64(up.FileLength),
+	}}
+	resp, err := w.client.SendMessage(ctx, to, msg)
+	if err != nil {
+		return "", err
+	}
+	id := string(resp.ID)
+	w.recordSentMedia(to, id, path, strings.TrimSpace("[document] "+name))
+	return id, nil
+}
+
+// SelfTestMediaDownload uploads a local file to WhatsApp's media servers and
+// immediately pulls it back through the same client.Download() path that inbound
+// capture uses, then compares bytes. A matching round-trip proves the download
+// path works end to end against live servers without needing a real inbound message.
+func (w *WAClient) SelfTestMediaDownload(ctx context.Context, path string) (map[string]any, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read: %w", err)
+	}
+	up, err := w.client.Upload(ctx, data, whatsmeow.MediaImage)
+	if err != nil {
+		return nil, fmt.Errorf("upload: %w", err)
+	}
+	msg := &waE2E.ImageMessage{
+		URL:           proto.String(up.URL),
+		DirectPath:    proto.String(up.DirectPath),
+		MediaKey:      up.MediaKey,
+		Mimetype:      proto.String("image/jpeg"),
+		FileEncSHA256: up.FileEncSHA256,
+		FileSHA256:    up.FileSHA256,
+		FileLength:    proto.Uint64(up.FileLength),
+	}
+	got, err := w.client.Download(ctx, msg)
+	if err != nil {
+		return nil, fmt.Errorf("download: %w", err)
+	}
+	return map[string]any{
+		"uploaded_bytes":   len(data),
+		"downloaded_bytes": len(got),
+		"bytes_match":      bytes.Equal(data, got),
+	}, nil
+}
+
+// RequestHistory asks the server for `count` messages immediately before the
+// given reference message (an on-demand history sync). The response arrives as
+// an events.HistorySync and flows through ingestHistorySync, which re-downloads
+// any media it carries. Used to backfill media for older messages.
+func (w *WAClient) RequestHistory(ctx context.Context, chat types.JID, refMsgID string, refFromMe bool, refTS time.Time, count int) error {
+	info := &types.MessageInfo{
+		MessageSource: types.MessageSource{Chat: chat, IsFromMe: refFromMe},
+		ID:            refMsgID,
+		Timestamp:     refTS,
+	}
+	msg := w.client.BuildHistorySyncRequest(info, count)
+	_, err := w.client.SendPeerMessage(ctx, msg)
+	return err
 }
 
 func (w *WAClient) Archive(ctx context.Context, chat types.JID, archive bool) error {

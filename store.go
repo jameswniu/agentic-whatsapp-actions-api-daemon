@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -58,6 +59,13 @@ func OpenStore(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	// Migration: media_path holds the on-disk path of downloaded media for a
+	// message. Idempotent — ignore the "duplicate column" error on re-open.
+	if _, err := db.Exec(`ALTER TABLE messages ADD COLUMN media_path TEXT`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
 }
 
@@ -73,6 +81,16 @@ type MessageRow struct {
 	FromMe     bool   `json:"from_me"`
 	Timestamp  int64  `json:"timestamp"`
 	Text       string `json:"text"`
+	MediaPath  string `json:"media_path,omitempty"`
+}
+
+// SetMediaPath records where a message's downloaded media was saved. Called
+// after the initial text upsert, once the download completes.
+func (s *Store) SetMediaPath(chatJID, msgID, path string) error {
+	_, err := s.db.Exec(
+		`UPDATE messages SET media_path=? WHERE chat_jid=? AND msg_id=?`,
+		path, chatJID, msgID)
+	return err
 }
 
 func (s *Store) UpsertMessage(m MessageRow) error {
@@ -98,11 +116,11 @@ func (s *Store) TouchChat(jid, name string, lastTS int64) error {
 
 func (s *Store) LastMessage(chatJID string) (*MessageRow, error) {
 	row := s.db.QueryRow(`
-		SELECT chat_jid, msg_id, COALESCE(sender_jid,''), from_me, timestamp, COALESCE(text,'')
+		SELECT chat_jid, msg_id, COALESCE(sender_jid,''), from_me, timestamp, COALESCE(text,''), COALESCE(media_path,'')
 		FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT 1`, chatJID)
 	var m MessageRow
 	var fromMe int
-	err := row.Scan(&m.ChatJID, &m.MsgID, &m.SenderJID, &fromMe, &m.Timestamp, &m.Text)
+	err := row.Scan(&m.ChatJID, &m.MsgID, &m.SenderJID, &fromMe, &m.Timestamp, &m.Text, &m.MediaPath)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -140,7 +158,7 @@ func (s *Store) ListChats(limit int) ([]ChatRow, error) {
 
 func (s *Store) GetMessages(chatJID string, limit int) ([]MessageRow, error) {
 	rows, err := s.db.Query(`
-		SELECT chat_jid, msg_id, COALESCE(sender_jid,''), from_me, timestamp, COALESCE(text,'')
+		SELECT chat_jid, msg_id, COALESCE(sender_jid,''), from_me, timestamp, COALESCE(text,''), COALESCE(media_path,'')
 		FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?`, chatJID, limit)
 	if err != nil {
 		return nil, err
@@ -150,7 +168,7 @@ func (s *Store) GetMessages(chatJID string, limit int) ([]MessageRow, error) {
 	for rows.Next() {
 		var m MessageRow
 		var fromMe int
-		if err := rows.Scan(&m.ChatJID, &m.MsgID, &m.SenderJID, &fromMe, &m.Timestamp, &m.Text); err != nil {
+		if err := rows.Scan(&m.ChatJID, &m.MsgID, &m.SenderJID, &fromMe, &m.Timestamp, &m.Text, &m.MediaPath); err != nil {
 			return nil, err
 		}
 		m.FromMe = fromMe == 1

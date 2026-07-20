@@ -11,6 +11,12 @@
 #
 # MESSAGING:
 #   wa send-audio <chat> <file.mp3> [seconds]     (playable audio; no caption field)
+#   wa send-image <chat> <file.jpg> [caption...]
+#   wa send-video <chat> <file.mp4> [caption...]
+#   wa send-doc   <chat> <file>     [caption...]
+#   Inbound image/video/audio/document/sticker are auto-downloaded to
+#   DATA_DIR/media; `wa messages` returns each row's media_path so the file
+#   can be opened, framed (video), or transcribed (audio).
 #   wa send <chat> <text...> [--mention <jid|number>]...
 #     A real @tag needs BOTH: "@<number>" inside the text AND --mention for that
 #     person. Text alone renders as plain characters and notifies nobody.
@@ -43,6 +49,10 @@
 #
 # PRESENCE:
 #   wa presence available|unavailable
+#
+# DIAGNOSTIC:
+#   wa selftest-media <file>       (upload+download round-trip; proves media path)
+#   wa request-history <chat> [n]  (on-demand backfill of older messages/media)
 set -eu
 
 ENV_FILE="${WA_ACTIOND_DIR:-$HOME/Projects/whatsapp-actiond-go}/.env"
@@ -89,6 +99,12 @@ case "$cmd" in
 
   send-audio) chat="$1"; shift; media="$1"; shift
          _post /actions/send_audio "$(_jb chat="$chat" media="$media" seconds="${1:-0}" dry_run=false)";;
+  send-image) chat="$1"; shift; media="$1"; shift
+         _post /actions/send_image "$(_jb chat="$chat" media="$media" caption="${*:-}" dry_run=false)";;
+  send-video) chat="$1"; shift; media="$1"; shift
+         _post /actions/send_video "$(_jb chat="$chat" media="$media" caption="${*:-}" dry_run=false)";;
+  send-doc)   chat="$1"; shift; media="$1"; shift
+         _post /actions/send_document "$(_jb chat="$chat" media="$media" caption="${*:-}" dry_run=false)";;
 
   send)  chat="$1"; shift
          MENTIONS=""; TEXT=()
@@ -114,6 +130,8 @@ case "$cmd" in
   group-topic) _flags "$@"; chat="${REST[1]}"; _post /actions/group_topic "$(_jb chat="$chat" topic="${REST[@]:1}" dry_run=$DRY)";;
   group-leave) _flags "$@"; _post /actions/group_leave "$(_jb chat="${REST[1]}" dry_run=$DRY)";;
 
+  selftest-media)   _post /actions/selftest_media   "$(_jb media="$1" dry_run=false)";;
+  request-history)  _post /actions/request_history  "$(_jb chat="$1" seconds="${2:-50}" dry_run=false)";;
   typing)     _post /actions/typing "$(_jb chat="$1" dry_run=false)";;
   stoptyping) _post /actions/stop_typing "$(_jb chat="$1" dry_run=false)";;
   presence)   _post /actions/presence "$(_jb text="${1:-available}" dry_run=false)";;

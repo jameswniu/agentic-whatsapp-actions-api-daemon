@@ -35,6 +35,16 @@ func (a *API) Routes() http.Handler {
 
 	mux.HandleFunc("POST /actions/send_audio", a.auth(a.action("send_audio",
 		opSpec{needsTarget: true, execR: a.opSendAudio})))
+	mux.HandleFunc("POST /actions/send_image", a.auth(a.action("send_image",
+		opSpec{needsTarget: true, execR: a.opSendImage})))
+	mux.HandleFunc("POST /actions/send_video", a.auth(a.action("send_video",
+		opSpec{needsTarget: true, execR: a.opSendVideo})))
+	mux.HandleFunc("POST /actions/send_document", a.auth(a.action("send_document",
+		opSpec{needsTarget: true, execR: a.opSendDocument})))
+	mux.HandleFunc("POST /actions/request_history", a.auth(a.action("request_history",
+		opSpec{needsTarget: true, execR: a.opRequestHistory})))
+	mux.HandleFunc("POST /actions/selftest_media", a.auth(a.action("selftest_media",
+		opSpec{needsTarget: false, execR: a.opSelfTestMedia})))
 	mux.HandleFunc("POST /actions/send", a.auth(a.action("send",
 		opSpec{needsTarget: true, execR: a.opSend})))
 	mux.HandleFunc("POST /actions/archive", a.auth(a.action("archive", a.opArchive(true))))
@@ -142,6 +152,7 @@ type ActionRequest struct {
 	// message/chat extras
 	Mentions []string `json:"mentions"`
 	Media    string   `json:"media"`
+	Caption  string   `json:"caption"`
 	Seconds  uint32   `json:"seconds"`
 	Emoji    string   `json:"emoji"`
 	FromMe bool   `json:"from_me"`
@@ -369,6 +380,64 @@ func (a *API) opSendAudio(ctx context.Context, req *ActionRequest, jid types.JID
 		return nil, err
 	}
 	return map[string]any{"msg_id": id}, nil
+}
+
+func (a *API) opSendImage(ctx context.Context, req *ActionRequest, jid types.JID) (map[string]any, error) {
+	if req.Media == "" {
+		return nil, errors.New("media (path to image file) is required")
+	}
+	id, err := a.wa.SendImage(ctx, jid, req.Media, req.Caption)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"msg_id": id}, nil
+}
+
+func (a *API) opSendVideo(ctx context.Context, req *ActionRequest, jid types.JID) (map[string]any, error) {
+	if req.Media == "" {
+		return nil, errors.New("media (path to video file) is required")
+	}
+	id, err := a.wa.SendVideo(ctx, jid, req.Media, req.Caption, req.Seconds)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"msg_id": id}, nil
+}
+
+func (a *API) opSendDocument(ctx context.Context, req *ActionRequest, jid types.JID) (map[string]any, error) {
+	if req.Media == "" {
+		return nil, errors.New("media (path to document file) is required")
+	}
+	id, err := a.wa.SendDocument(ctx, jid, req.Media, req.Caption)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"msg_id": id}, nil
+}
+
+func (a *API) opSelfTestMedia(ctx context.Context, req *ActionRequest, _ types.JID) (map[string]any, error) {
+	if req.Media == "" {
+		return nil, errors.New("media (path to a local file) is required")
+	}
+	return a.wa.SelfTestMediaDownload(ctx, req.Media)
+}
+
+func (a *API) opRequestHistory(ctx context.Context, req *ActionRequest, jid types.JID) (map[string]any, error) {
+	last, err := a.store.LastMessage(jid.String())
+	if err != nil {
+		return nil, err
+	}
+	if last == nil {
+		return nil, errors.New("no known message to anchor the history request")
+	}
+	count := int(req.Seconds)
+	if count <= 0 {
+		count = 50
+	}
+	if err := a.wa.RequestHistory(ctx, jid, last.MsgID, last.FromMe, time.UnixMilli(last.Timestamp), count); err != nil {
+		return nil, err
+	}
+	return map[string]any{"requested_before": last.MsgID, "count": count}, nil
 }
 
 func (a *API) opSend(ctx context.Context, req *ActionRequest, jid types.JID) (map[string]any, error) {
