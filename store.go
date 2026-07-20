@@ -66,12 +66,13 @@ func (s *Store) Close() error { return s.db.Close() }
 // ---- messages / chats ----
 
 type MessageRow struct {
-	ChatJID   string `json:"chat_jid"`
-	MsgID     string `json:"msg_id"`
-	SenderJID string `json:"sender_jid"`
-	FromMe    bool   `json:"from_me"`
-	Timestamp int64  `json:"timestamp"`
-	Text      string `json:"text"`
+	ChatJID    string `json:"chat_jid"`
+	MsgID      string `json:"msg_id"`
+	SenderJID  string `json:"sender_jid"`
+	SenderName string `json:"sender_name,omitempty"`
+	FromMe     bool   `json:"from_me"`
+	Timestamp  int64  `json:"timestamp"`
+	Text       string `json:"text"`
 }
 
 func (s *Store) UpsertMessage(m MessageRow) error {

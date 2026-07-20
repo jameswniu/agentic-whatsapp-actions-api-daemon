@@ -670,6 +670,27 @@ func (a *API) handleGetMessages(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	// Resolve each sender to a human name so a reader sees who spoke, not a raw
+	// LID/phone JID. Own messages are labelled "you"; unattributed rows fall back
+	// to the chat JID (correct for 1:1 chats).
+	nameCache := map[string]string{}
+	for i := range msgs {
+		if msgs[i].FromMe {
+			msgs[i].SenderName = "you"
+			continue
+		}
+		s := msgs[i].SenderJID
+		if s == "" {
+			s = jid.String()
+		}
+		if n, ok := nameCache[s]; ok {
+			msgs[i].SenderName = n
+		} else {
+			n = a.wa.ResolveName(s)
+			nameCache[s] = n
+			msgs[i].SenderName = n
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"chat": jid.String(), "messages": msgs, "count": len(msgs)})
 }
 

@@ -245,17 +245,46 @@ func (w *WAClient) ingestHistorySync(e *events.HistorySync) int {
 	return n
 }
 
+// extractText renders any WhatsApp message into a readable one-line string.
+// Media types become bracketed labels with whatever metadata is available
+// (caption, duration, filename, coordinates) so a text-only reader still knows
+// what arrived. Trailing whitespace from empty captions is trimmed.
 func extractText(m *waE2E.Message) string {
+	return strings.TrimSpace(extractRaw(m))
+}
+
+// mediaLabel builds "[kind Ns] caption", omitting the duration when zero and the
+// trailing space when there is no caption.
+func mediaLabel(kind, caption string, seconds int) string {
+	label := "[" + kind
+	if seconds > 0 {
+		label += fmt.Sprintf(" %ds", seconds)
+	}
+	label += "]"
+	if caption != "" {
+		return label + " " + caption
+	}
+	return label
+}
+
+func extractRaw(m *waE2E.Message) string {
 	if m == nil {
 		return ""
 	}
 	// Unwrap containers: self-chat sends arrive as DeviceSentMessage,
-	// disappearing-mode chats wrap in EphemeralMessage.
+	// disappearing-mode chats wrap in EphemeralMessage, and view-once media
+	// nests the real payload one level down.
 	if ds := m.GetDeviceSentMessage(); ds != nil && ds.GetMessage() != nil {
-		return extractText(ds.GetMessage())
+		return extractRaw(ds.GetMessage())
 	}
 	if em := m.GetEphemeralMessage(); em != nil && em.GetMessage() != nil {
-		return extractText(em.GetMessage())
+		return extractRaw(em.GetMessage())
+	}
+	if vo := m.GetViewOnceMessage(); vo != nil && vo.GetMessage() != nil {
+		return "[view-once] " + extractRaw(vo.GetMessage())
+	}
+	if vo := m.GetViewOnceMessageV2(); vo != nil && vo.GetMessage() != nil {
+		return "[view-once] " + extractRaw(vo.GetMessage())
 	}
 	if t := m.GetConversation(); t != "" {
 		return t
@@ -264,19 +293,57 @@ func extractText(m *waE2E.Message) string {
 		return et.GetText()
 	}
 	if im := m.GetImageMessage(); im != nil {
-		return "[image] " + im.GetCaption()
+		return mediaLabel("image", im.GetCaption(), 0)
 	}
 	if vm := m.GetVideoMessage(); vm != nil {
-		return "[video] " + vm.GetCaption()
+		return mediaLabel("video", vm.GetCaption(), int(vm.GetSeconds()))
 	}
-	if m.GetAudioMessage() != nil {
-		return "[audio]"
+	if am := m.GetAudioMessage(); am != nil {
+		kind := "audio"
+		if am.GetPTT() {
+			kind = "voice note"
+		}
+		return mediaLabel(kind, "", int(am.GetSeconds()))
 	}
 	if dm := m.GetDocumentMessage(); dm != nil {
-		return "[document] " + dm.GetFileName()
+		name := dm.GetFileName()
+		if name == "" {
+			name = dm.GetTitle()
+		}
+		return strings.TrimSpace("[document] " + name)
 	}
 	if m.GetStickerMessage() != nil {
 		return "[sticker]"
+	}
+	if lm := m.GetLocationMessage(); lm != nil {
+		if n := lm.GetName(); n != "" {
+			return "[location] " + n
+		}
+		return fmt.Sprintf("[location] %.5f,%.5f", lm.GetDegreesLatitude(), lm.GetDegreesLongitude())
+	}
+	if m.GetLiveLocationMessage() != nil {
+		return "[live location]"
+	}
+	if cm := m.GetContactMessage(); cm != nil {
+		return strings.TrimSpace("[contact] " + cm.GetDisplayName())
+	}
+	if cam := m.GetContactsArrayMessage(); cam != nil {
+		return fmt.Sprintf("[contacts] %d shared", len(cam.GetContacts()))
+	}
+	if rm := m.GetReactionMessage(); rm != nil {
+		return strings.TrimSpace("[reaction] " + rm.GetText())
+	}
+	if pm := m.GetPollCreationMessage(); pm != nil {
+		return strings.TrimSpace("[poll] " + pm.GetName())
+	}
+	if gm := m.GetGroupInviteMessage(); gm != nil {
+		return strings.TrimSpace("[group invite] " + gm.GetGroupName())
+	}
+	if pm := m.GetProtocolMessage(); pm != nil {
+		if pm.GetType() == waE2E.ProtocolMessage_REVOKE {
+			return "[deleted]"
+		}
+		return ""
 	}
 	return ""
 }
@@ -340,6 +407,10 @@ func (w *WAClient) ResolveName(jidStr string) string {
 	if err != nil {
 		return ""
 	}
+	// Group-participant senders carry a device suffix (e.g. "...:22@lid") that
+	// misses both the LID->phone and contact lookups. Normalise to the bare
+	// user JID so resolution hits.
+	jid = jid.ToNonAD()
 	ctx := context.Background()
 
 	switch jid.Server {
