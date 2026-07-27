@@ -39,6 +39,11 @@ type WAClient struct {
 	connectedAt      atomic.Int64 // unix ms
 	lastEventAt      atomic.Int64 // unix ms, any event
 	historySyncCount atomic.Int64
+
+	// lastConnErr holds the verbatim error string from the most recent failed
+	// dial, so a readiness gate can report WHY the socket is down instead of
+	// only that it is. Empty once a dial succeeds.
+	lastConnErr atomic.Value // string
 }
 
 func NewWAClient(cfg *Config, st *Store) (*WAClient, error) {
@@ -140,12 +145,46 @@ func (w *WAClient) PairWithCode(ctx context.Context, phone string) error {
 	return errors.New("timed out waiting for code entry on phone (3m)")
 }
 
-// Start connects a previously paired session. Auto-reconnect is whatsmeow's default.
+// Start begins connecting a previously paired session. The initial dial is
+// retried with backoff in a background goroutine: whatsmeow's built-in
+// auto-reconnect only covers drops AFTER a successful connect, so a failed
+// INITIAL dial (a transient network blip at boot) would otherwise leave the
+// socket dead indefinitely with the process still alive. This loop closes that
+// gap; once the first connect lands, whatsmeow owns reconnection for the
+// session lifetime.
 func (w *WAClient) Start() error {
 	if !w.IsPaired() {
 		return errors.New("not paired; run with -pair first")
 	}
-	return w.client.Connect()
+	go w.connectWithRetry()
+	return nil
+}
+
+// connectWithRetry dials until the initial connection succeeds, then returns
+// and hands off to whatsmeow's auto-reconnect. A LoggedOut event disconnects
+// separately and never re-enters here, so this cannot fight a real logout.
+func (w *WAClient) connectWithRetry() {
+	backoff := 2 * time.Second
+	const maxBackoff = 60 * time.Second
+	for attempt := 1; ; attempt++ {
+		if w.client.IsConnected() {
+			return
+		}
+		err := w.client.Connect()
+		if err == nil || errors.Is(err, whatsmeow.ErrAlreadyConnected) {
+			w.lastConnErr.Store("")
+			return
+		}
+		w.lastConnErr.Store(err.Error())
+		slog.Warn("wa_connect_retry", "attempt", attempt, "error", err.Error(),
+			"next_retry_s", int(backoff.Seconds()))
+		time.Sleep(backoff)
+		if backoff < maxBackoff {
+			if backoff *= 2; backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
 }
 
 func (w *WAClient) Stop() {
@@ -528,10 +567,22 @@ func extractRaw(m *waE2E.Message) string {
 
 // ---- readiness gates ----
 
+// ErrNotConnected names the component whose socket is down. The old wording
+// ("whatsapp connection is down") was accurate but ambiguous: this daemon holds
+// its OWN whatsmeow session, separate from the OpenClaw whatsapp channel, so a
+// bare "whatsapp is down" sent operators to probe the wrong client. Callers get
+// the underlying dial error verbatim alongside this via LastConnectError.
 var (
-	ErrNotConnected = errors.New("whatsapp connection is down")
+	ErrNotConnected = errors.New("whatsapp-actiond's own whatsmeow socket is down (this is the actiond daemon session, NOT the OpenClaw whatsapp channel; check `wa health`, not `openclaw channels status`)")
 	ErrNotSynced    = errors.New("post-reconnect sync incomplete; destructive ops gated")
 )
+
+// LastConnectError returns the verbatim error from the most recent failed dial,
+// or "" if the last dial succeeded or none has run. Never paraphrased.
+func (w *WAClient) LastConnectError() string {
+	s, _ := w.lastConnErr.Load().(string)
+	return s
+}
 
 // WaitConnected blocks up to timeout for the socket to be up.
 func (w *WAClient) WaitConnected(timeout time.Duration) error {
@@ -743,8 +794,10 @@ func (w *WAClient) SendImage(ctx context.Context, to types.JID, path, caption st
 }
 
 // SendVideo uploads a local video and sends it with an optional caption. Duration
-// is probed with ffprobe when available; a zero duration still sends fine.
-func (w *WAClient) SendVideo(ctx context.Context, to types.JID, path, caption string, seconds uint32) (string, error) {
+// is probed with ffprobe when available; a zero duration still sends fine. A
+// caption can @-tag participants on the same terms as text: the literal
+// "@<number>" in the caption AND the tagged JID in ContextInfo.MentionedJID.
+func (w *WAClient) SendVideo(ctx context.Context, to types.JID, path, caption string, seconds uint32, mentions []string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("read video: %w", err)
@@ -753,7 +806,7 @@ func (w *WAClient) SendVideo(ctx context.Context, to types.JID, path, caption st
 	if err != nil {
 		return "", fmt.Errorf("upload video: %w", err)
 	}
-	msg := &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
+	vid := &waE2E.VideoMessage{
 		Caption:       proto.String(caption),
 		URL:           proto.String(up.URL),
 		DirectPath:    proto.String(up.DirectPath),
@@ -763,7 +816,11 @@ func (w *WAClient) SendVideo(ctx context.Context, to types.JID, path, caption st
 		FileSHA256:    up.FileSHA256,
 		FileLength:    proto.Uint64(up.FileLength),
 		Seconds:       proto.Uint32(seconds),
-	}}
+	}
+	if len(mentions) > 0 {
+		vid.ContextInfo = &waE2E.ContextInfo{MentionedJID: mentions}
+	}
+	msg := &waE2E.Message{VideoMessage: vid}
 	resp, err := w.client.SendMessage(ctx, to, msg)
 	if err != nil {
 		return "", err

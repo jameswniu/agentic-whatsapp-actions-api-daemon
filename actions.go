@@ -283,14 +283,20 @@ func (a *API) action(name string, spec opSpec) http.HandlerFunc {
 			return
 		}
 
-		// Connection + accuracy gates.
+		// Connection + accuracy gates. The gate error is reported with the real
+		// dial failure attached, so "socket is down" arrives with the reason it
+		// is down (e.g. "no route to host") rather than as a bare assertion.
 		if err := a.wa.WaitConnected(a.cfg.ConnectWaitTimeout); err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+			slog.Error("action_blocked_not_connected", "action", name, "chat", jid.String(),
+				"error", err.Error(), "cause", a.wa.LastConnectError())
+			writeJSON(w, http.StatusServiceUnavailable,
+				errorPayload(err, name, jid.String(), a.wa.LastConnectError()))
 			return
 		}
 		if spec.destructive {
 			if err := a.wa.DestructiveReady(); err != nil {
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+				writeJSON(w, http.StatusServiceUnavailable,
+					errorPayload(err, name, jid.String(), a.wa.LastConnectError()))
 				return
 			}
 		}
@@ -320,9 +326,13 @@ func (a *API) action(name string, spec opSpec) http.HandlerFunc {
 		if execErr != nil {
 			_ = a.store.FinishAction(entry.ID, "failed", execErr.Error())
 			slog.Error("action_failed", "action", name, "chat", jid.String(), "error", execErr.Error())
-			writeJSON(w, http.StatusBadGateway, map[string]any{
-				"action_id": entry.ID, "action": name, "status": "failed", "error": execErr.Error(),
-			})
+			// The op's own error propagates verbatim, with its type and any
+			// wrapped inner error, so a send failure can never be read as a
+			// connectivity failure.
+			payload := errorPayload(execErr, name, jid.String(), "")
+			payload["action_id"] = entry.ID
+			payload["status"] = "failed"
+			writeJSON(w, http.StatusBadGateway, payload)
 			return
 		}
 		_ = a.store.FinishAction(entry.ID, "succeeded", "")
@@ -397,7 +407,7 @@ func (a *API) opSendVideo(ctx context.Context, req *ActionRequest, jid types.JID
 	if req.Media == "" {
 		return nil, errors.New("media (path to video file) is required")
 	}
-	id, err := a.wa.SendVideo(ctx, jid, req.Media, req.Caption, req.Seconds)
+	id, err := a.wa.SendVideo(ctx, jid, req.Media, req.Caption, req.Seconds, normalizeMentions(req.Mentions))
 	if err != nil {
 		return nil, err
 	}
@@ -811,6 +821,40 @@ func (a *API) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---- helpers ----
+
+// errorPayload builds the failure body callers (the `wa` CLI, and agents
+// reading its stdout) receive. Every field here is produced by code from the
+// real error value: nothing is summarised, inferred, or generated downstream.
+//
+//	error      - err.Error(), verbatim
+//	error_type - concrete Go type, so a readiness gate is distinguishable from
+//	             a send failure without string-matching the message
+//	cause      - the underlying error verbatim when one was wrapped or recorded
+//	action/chat- the offending arguments, echoed back
+//
+// A wrong error is worse than no error: if there is no known cause, `cause` is
+// omitted rather than filled with a guess.
+func errorPayload(err error, action string, chat string, cause string) map[string]any {
+	p := map[string]any{
+		"error":      err.Error(),
+		"error_type": fmt.Sprintf("%T", err),
+		"action":     action,
+	}
+	if chat != "" {
+		p["chat"] = chat
+	}
+	// Prefer an explicitly recorded cause; otherwise fall back to an unwrapped
+	// inner error. Only set when it adds information beyond `error`.
+	if cause == "" {
+		if inner := errors.Unwrap(err); inner != nil {
+			cause = inner.Error()
+		}
+	}
+	if cause != "" && cause != err.Error() {
+		p["cause"] = cause
+	}
+	return p
+}
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
