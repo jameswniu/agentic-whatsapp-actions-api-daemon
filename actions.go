@@ -884,7 +884,7 @@ func (a *API) handlePair(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	phone := strings.TrimPrefix(strings.TrimSpace(body.Phone), "+")
 	if phone == "" {
-		phone = "19995550000" // James's number; override via body.phone
+		phone = "19995550000" // placeholder; override via body.phone
 	}
 	code, err := a.wa.PairForCode(r.Context(), phone)
 	if err != nil {
