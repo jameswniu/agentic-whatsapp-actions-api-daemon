@@ -1,4 +1,4 @@
-# personal-whatsapp-actions-api-daemon
+# ai-agent-whatsapp-actions-api-daemon
 
 **A local HTTP API that makes a personal WhatsApp account scriptable, with the brakes built in.**
 
